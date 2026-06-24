@@ -1,0 +1,1346 @@
+#!/usr/bin/env python3
+"""
+xPsiphon terminal manager.
+
+Runs and manages one Psiphon tunnel-core process per location config.
+Designed for Ubuntu servers with only Python 3 standard library available.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import textwrap
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+
+APP_NAME = "xpsiphon"
+SERVICE_NAME = "xpsiphon.service"
+DEFAULT_BIN = "/etc/psiphon/psiphon-tunnel-core-x86_64"
+DEFAULT_CONF_DIR = "/etc/psiphon/configs"
+DEFAULT_DATA_DIR = "/tmp/psiphon"
+DEFAULT_LOG_DIR = "/var/log/xpsiphon"
+DEFAULT_RUN_DIR = "/run/xpsiphon"
+DEFAULT_SERVICE_PATH = f"/etc/systemd/system/{SERVICE_NAME}"
+ONE_LINE_INSTALL = "bash <(curl -fsSL https://raw.githubusercontent.com/IzumiRain/xPsiphon/main/install.sh)"
+DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
+DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=1048576"
+
+
+@dataclass(frozen=True)
+class Paths:
+    psiphon_bin: Path
+    conf_dir: Path
+    data_dir: Path
+    log_dir: Path
+    run_dir: Path
+    service_path: Path
+    command_path: str
+
+
+@dataclass(frozen=True)
+class Location:
+    code: str
+    name: str
+    config_path: Path
+    socks_port: str
+    http_port: str
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    pid: int
+    cpu: str
+    mem: str
+    rss: str
+    elapsed: str
+    command: str
+
+
+def env_path(name: str, default: str) -> Path:
+    return Path(os.environ.get(name, default)).expanduser()
+
+
+def build_paths() -> Paths:
+    command_path = os.environ.get("XPSIPHON_COMMAND", shutil.which(APP_NAME) or "/usr/local/bin/xpsiphon")
+    return Paths(
+        psiphon_bin=env_path("XPSIPHON_BIN", DEFAULT_BIN),
+        conf_dir=env_path("XPSIPHON_CONF_DIR", DEFAULT_CONF_DIR),
+        data_dir=env_path("XPSIPHON_DATA_DIR", DEFAULT_DATA_DIR),
+        log_dir=env_path("XPSIPHON_LOG_DIR", DEFAULT_LOG_DIR),
+        run_dir=env_path("XPSIPHON_RUN_DIR", DEFAULT_RUN_DIR),
+        service_path=env_path("XPSIPHON_SERVICE_PATH", DEFAULT_SERVICE_PATH),
+        command_path=command_path,
+    )
+
+
+def supports_color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+class Color:
+    enabled = supports_color()
+
+    @classmethod
+    def paint(cls, text: str, code: str) -> str:
+        if not cls.enabled:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    @classmethod
+    def green(cls, text: str) -> str:
+        return cls.paint(text, "32")
+
+    @classmethod
+    def red(cls, text: str) -> str:
+        return cls.paint(text, "31")
+
+    @classmethod
+    def yellow(cls, text: str) -> str:
+        return cls.paint(text, "33")
+
+    @classmethod
+    def cyan(cls, text: str) -> str:
+        return cls.paint(text, "36")
+
+    @classmethod
+    def bold(cls, text: str) -> str:
+        return cls.paint(text, "1")
+
+
+def print_error(message: str) -> None:
+    print(f"{Color.red('error:')} {message}", file=sys.stderr)
+
+
+def print_warning(message: str) -> None:
+    print(f"{Color.yellow('warning:')} {message}")
+
+
+def require_root(action: str) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise SystemExit(f"{action} requires root. Re-run with sudo.")
+
+
+def ensure_dirs(paths: Paths) -> None:
+    for directory in (paths.data_dir, paths.log_dir, paths.run_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def read_json_config(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+
+
+def discover_locations(paths: Paths) -> list[Location]:
+    if not paths.conf_dir.exists():
+        return []
+
+    locations: list[Location] = []
+    def sort_key(config_path: Path) -> tuple[int, str]:
+        return (0 if config_path.name == "psiphon.AUTO.config" else 1, config_path.name)
+
+    for config_path in sorted(paths.conf_dir.glob("psiphon.*.config"), key=sort_key):
+        match = re.fullmatch(r"psiphon\.([A-Za-z0-9_-]+)\.config", config_path.name)
+        if not match:
+            continue
+        code = match.group(1).upper()
+        try:
+            data = read_json_config(config_path)
+        except ValueError as exc:
+            print_warning(str(exc))
+            data = {}
+
+        egress = str(data.get("EgressRegion") or code).upper()
+        locations.append(
+            Location(
+                code=code,
+                name=egress,
+                config_path=config_path,
+                socks_port=str(data.get("LocalSocksProxyPort", "-")),
+                http_port=str(data.get("LocalHttpProxyPort", "-")),
+            )
+        )
+    return locations
+
+
+def location_kind(location: Location) -> str:
+    return "Auto" if location.code == "AUTO" else "Fixed"
+
+
+def normalize_code(code: str) -> str:
+    return code.strip().upper()
+
+
+def location_map(paths: Paths) -> dict[str, Location]:
+    return {location.code: location for location in discover_locations(paths)}
+
+
+def resolve_locations(paths: Paths, target: str) -> list[Location]:
+    locations = discover_locations(paths)
+    if target.lower() == "all":
+        return locations
+
+    code = normalize_code(target)
+    for location in locations:
+        if location.code == code:
+            return [location]
+    available = ", ".join(location.code for location in locations) or "none"
+    raise SystemExit(f"unknown location '{target}'. Available locations: {available}")
+
+
+def pid_file(paths: Paths, location: Location) -> Path:
+    return paths.run_dir / f"{location.code}.pid"
+
+
+def data_root(paths: Paths, location: Location) -> Path:
+    return paths.data_dir / f"psiphon.{location.code}"
+
+
+def log_file(paths: Paths, location: Location) -> Path:
+    return paths.log_dir / f"psiphon.{location.code}.log"
+
+
+def read_pid(path: Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not value.isdigit():
+        return None
+    return int(value)
+
+
+def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+
+
+def pid_matches_location(pid: int, paths: Paths, location: Location) -> bool:
+    cmdline = read_proc_cmdline(pid)
+    if not cmdline:
+        return False
+    return str(location.config_path) in cmdline and str(paths.psiphon_bin) in cmdline
+
+
+def pid_from_file(paths: Paths, location: Location) -> int | None:
+    pid = read_pid(pid_file(paths, location))
+    if pid is None or not process_alive(pid):
+        return None
+    if pid_matches_location(pid, paths, location):
+        return pid
+    return None
+
+
+def pgrep_by_config(paths: Paths, location: Location) -> list[int]:
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+
+    pids: list[int] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid_matches_location(pid, paths, location):
+            pids.append(pid)
+    return sorted(pids)
+
+
+def running_pids(paths: Paths, location: Location) -> list[int]:
+    pids: list[int] = []
+    file_pid = pid_from_file(paths, location)
+    if file_pid is not None:
+        pids.append(file_pid)
+    for pid in pgrep_by_config(paths, location):
+        if pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def ps_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
+    if not pids:
+        return {}
+    cmd = ["ps", "-o", "pid=,pcpu=,pmem=,rss=,etime=,args=", "-p", ",".join(str(pid) for pid in pids)]
+    try:
+        result = subprocess.run(cmd, check=False, text=True, capture_output=True)
+    except FileNotFoundError:
+        return {}
+    if result.returncode not in (0, 1):
+        return {}
+
+    rows: dict[int, ProcessInfo] = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 5)
+        if len(parts) < 5 or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        command = parts[5] if len(parts) > 5 else ""
+        rows[pid] = ProcessInfo(
+            pid=pid,
+            cpu=parts[1],
+            mem=parts[2],
+            rss=parts[3],
+            elapsed=parts[4],
+            command=command,
+        )
+    return rows
+
+
+def run_text(command: Sequence[str]) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+    except FileNotFoundError:
+        return 127, "", f"{command[0]} not found"
+    return result.returncode, result.stdout, result.stderr
+
+
+def format_rss(kb: str) -> str:
+    if not kb.isdigit():
+        return "-"
+    value = int(kb)
+    if value >= 1024 * 1024:
+        return f"{value / 1024 / 1024:.1f}G"
+    if value >= 1024:
+        return f"{value / 1024:.1f}M"
+    return f"{value}K"
+
+
+def trim(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 3] + "..." if width > 3 else text[:width]
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def visible_len(text: object) -> int:
+    return len(ANSI_RE.sub("", str(text)))
+
+
+def pad_visible(text: object, width: int) -> str:
+    value = str(text)
+    return value + (" " * max(width - visible_len(value), 0))
+
+
+def table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    if not rows:
+        widths = [len(header) for header in headers]
+    else:
+        widths = [
+            max(visible_len(headers[index]), *(visible_len(row[index]) for row in rows))
+            for index in range(len(headers))
+        ]
+
+    header_line = "  ".join(pad_visible(header, widths[index]) for index, header in enumerate(headers))
+    sep_line = "  ".join("-" * width for width in widths)
+    row_lines = [
+        "  ".join(pad_visible(value, widths[index]) for index, value in enumerate(row))
+        for row in rows
+    ]
+    return "\n".join([Color.bold(header_line), sep_line, *row_lines])
+
+
+def server_status() -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    rows.append(("Host", socket.gethostname()))
+    rows.append(("User", getpass.getuser()))
+
+    try:
+        uptime_seconds = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+        days = int(uptime_seconds // 86400)
+        hours = int((uptime_seconds % 86400) // 3600)
+        minutes = int((uptime_seconds % 3600) // 60)
+        if days:
+            uptime = f"{days}d {hours}h {minutes}m"
+        elif hours:
+            uptime = f"{hours}h {minutes}m"
+        else:
+            uptime = f"{minutes}m"
+        rows.append(("Uptime", uptime))
+    except OSError:
+        pass
+
+    if hasattr(os, "getloadavg"):
+        try:
+            load1, load5, load15 = os.getloadavg()
+            rows.append(("Load", f"{load1:.2f} {load5:.2f} {load15:.2f}"))
+        except OSError:
+            pass
+
+    mem_info = read_meminfo()
+    if mem_info:
+        total = mem_info.get("MemTotal", 0)
+        available = mem_info.get("MemAvailable", 0)
+        used = max(total - available, 0)
+        rows.append(("Memory", f"{bytes_human(used * 1024)} / {bytes_human(total * 1024)}"))
+
+    try:
+        usage = shutil.disk_usage("/")
+        rows.append(("Disk /", f"{bytes_human(usage.used)} / {bytes_human(usage.total)}"))
+    except OSError:
+        pass
+
+    return rows
+
+
+def read_meminfo() -> dict[str, int]:
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    values: dict[str, int] = {}
+    for line in lines:
+        key, _, rest = line.partition(":")
+        parts = rest.strip().split()
+        if parts and parts[0].isdigit():
+            values[key] = int(parts[0])
+    return values
+
+
+def bytes_human(value: int) -> str:
+    units = ["B", "K", "M", "G", "T"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount)}{unit}"
+            return f"{amount:.1f}{unit}"
+        amount /= 1024
+    return f"{amount:.1f}T"
+
+
+def speed_human(bytes_per_second: float) -> str:
+    if bytes_per_second <= 0:
+        return "-"
+    return f"{bytes_human(int(bytes_per_second))}/s"
+
+
+def can_connect(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def status_rows(paths: Paths, locations: Sequence[Location]) -> tuple[list[list[str]], float, float, int]:
+    all_pids: list[int] = []
+    location_pids: dict[str, list[int]] = {}
+    for location in locations:
+        pids = running_pids(paths, location)
+        location_pids[location.code] = pids
+        all_pids.extend(pids)
+
+    proc_info = ps_rows(all_pids)
+    rows: list[list[str]] = []
+    total_cpu = 0.0
+    total_mem = 0.0
+    running_count = 0
+
+    for location in locations:
+        pids = location_pids[location.code]
+        if not pids:
+            rows.append([
+                location.code,
+                Color.red("stopped"),
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                location.socks_port,
+                location.http_port,
+            ])
+            continue
+
+        for index, pid in enumerate(pids):
+            info = proc_info.get(pid)
+            cpu = info.cpu if info else "-"
+            mem = info.mem if info else "-"
+            rss = format_rss(info.rss) if info else "-"
+            elapsed = info.elapsed if info else "-"
+            try:
+                total_cpu += float(cpu)
+            except ValueError:
+                pass
+            try:
+                total_mem += float(mem)
+            except ValueError:
+                pass
+            running_count += 1
+            rows.append([
+                location.code if index == 0 else "",
+                Color.green("running"),
+                str(pid),
+                cpu,
+                mem,
+                rss,
+                elapsed,
+                location.socks_port if index == 0 else "",
+                location.http_port if index == 0 else "",
+            ])
+    return rows, total_cpu, total_mem, running_count
+
+
+def print_status(paths: Paths) -> int:
+    locations = discover_locations(paths)
+    print(Color.bold(Color.cyan("xPsiphon Status")))
+    print()
+    print(table(["Metric", "Value"], server_status()))
+    print()
+
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return 1
+
+    rows, total_cpu, total_mem, running_count = status_rows(paths, locations)
+    print(table(["Loc", "State", "PID", "CPU%", "MEM%", "RSS", "Uptime", "SOCKS", "HTTP"], rows))
+    print()
+    state = Color.green(f"{running_count} running") if running_count else Color.yellow("0 running")
+    print(f"Psiphon processes: {state} | aggregate CPU {total_cpu:.1f}% | aggregate MEM {total_mem:.1f}%")
+    print(f"Logs: {Color.cyan(str(paths.log_dir))}")
+    return 0
+
+
+def collect_ports(locations: Sequence[Location]) -> list[tuple[str, str, int]]:
+    ports: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for location in locations:
+        for kind, value in (("SOCKS", location.socks_port), ("HTTP", location.http_port)):
+            if not str(value).isdigit():
+                continue
+            port = int(value)
+            key = (kind, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            ports.append((location.code, kind, port))
+    return ports
+
+
+def parse_listening_ports() -> set[int]:
+    ports: set[int] = set()
+    code, stdout, _ = run_text(["ss", "-H", "-ltn"])
+    if code != 0:
+        code, stdout, _ = run_text(["netstat", "-ltn"])
+    if code != 0:
+        return ports
+    for line in stdout.splitlines():
+        for token in line.split():
+            if ":" not in token:
+                continue
+            port = token.rsplit(":", 1)[-1]
+            if port.isdigit():
+                ports.add(int(port))
+    return ports
+
+
+def read_ufw_status() -> tuple[str, str]:
+    code, stdout, stderr = run_text(["ufw", "status", "numbered"])
+    if code == 127:
+        return "missing", ""
+    text = stdout + "\n" + stderr
+    if "Status: inactive" in text:
+        return "inactive", text
+    if code == 0:
+        return "active", text
+    return "unknown", text
+
+
+def read_firewalld_state() -> tuple[str, set[int]]:
+    code, stdout, _ = run_text(["firewall-cmd", "--state"])
+    if code == 127:
+        return "missing", set()
+    if code != 0 or stdout.strip() != "running":
+        return "inactive", set()
+    code, stdout, _ = run_text(["firewall-cmd", "--list-ports"])
+    ports: set[int] = set()
+    if code == 0:
+        for token in stdout.split():
+            port, _, proto = token.partition("/")
+            if proto == "tcp" and port.isdigit():
+                ports.add(int(port))
+    return "active", ports
+
+
+def ufw_allows_port(ufw_state: str, ufw_text: str, port: int) -> str:
+    if ufw_state == "missing":
+        return "ufw n/a"
+    if ufw_state == "inactive":
+        return "ufw inactive"
+    if ufw_state != "active":
+        return "ufw unknown"
+
+    for line in ufw_text.splitlines():
+        if re.search(rf"\b{port}/tcp\b|\b{port}\b", line) and "ALLOW" in line.upper():
+            return "allowed"
+    return "not listed"
+
+
+def port_bind_status(port: int) -> str:
+    for host in ("127.0.0.1", "0.0.0.0"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+        except OSError:
+            return "in use"
+        finally:
+            sock.close()
+    return "free"
+
+
+def firewall_recommendations(ports: Sequence[tuple[str, str, int]]) -> list[str]:
+    unique_ports = sorted({port for _, _, port in ports})
+    if not unique_ports:
+        return []
+    port_args = " ".join(f"{port}/tcp" for port in unique_ports)
+    socks_ports = sorted({port for _, kind, port in ports if kind == "SOCKS"})
+    http_ports = sorted({port for _, kind, port in ports if kind == "HTTP"})
+    ufw_examples = []
+    if socks_ports:
+        ufw_examples.append(f"sudo ufw allow from YOUR_IP to any port {socks_ports[0]}:{socks_ports[-1]} proto tcp")
+    if http_ports:
+        ufw_examples.append(f"sudo ufw allow from YOUR_IP to any port {http_ports[0]}:{http_ports[-1]} proto tcp")
+    return [
+        "If these proxies must be reachable from outside the server, allow only trusted source IPs.",
+        "UFW examples: " + " ; ".join(ufw_examples),
+        f"firewalld example: sudo firewall-cmd --permanent " + " ".join(f"--add-port={port}/tcp" for port in unique_ports),
+        f"Port list: {port_args}",
+    ]
+
+
+def command_firewall(paths: Paths) -> int:
+    locations = discover_locations(paths)
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return 1
+
+    ports = collect_ports(locations)
+    listening = parse_listening_ports()
+    ufw_state, ufw_text = read_ufw_status()
+    firewalld_state, firewalld_ports = read_firewalld_state()
+
+    print(Color.bold(Color.cyan("xPsiphon Firewall And Port Check")))
+    print()
+    print(table([
+        "Firewall",
+        "State",
+    ], [
+        ["ufw", ufw_state],
+        ["firewalld", firewalld_state],
+    ]))
+    print()
+
+    rows: list[list[str]] = []
+    for code, kind, port in ports:
+        listen_state = Color.green("listening") if port in listening else Color.yellow(port_bind_status(port))
+        ufw = ufw_allows_port(ufw_state, ufw_text, port)
+        if ufw == "allowed":
+            ufw = Color.green(ufw)
+        elif ufw == "not listed":
+            ufw = Color.yellow(ufw)
+
+        if firewalld_state == "active":
+            firewalld = Color.green("allowed") if port in firewalld_ports else Color.yellow("not listed")
+        else:
+            firewalld = f"firewalld {firewalld_state}"
+
+        rows.append([code, kind, str(port), listen_state, ufw, firewalld])
+
+    print(table(["Loc", "Type", "Port", "Local", "UFW", "firewalld"], rows))
+    print()
+    for line in firewall_recommendations(ports):
+        print(f"- {line}")
+    return 0
+
+
+def curl_probe(proxy_port: int, url: str, timeout: int) -> tuple[bool, str, str, float]:
+    curl = shutil.which("curl")
+    if not curl:
+        return False, "-", "-", 0.0
+
+    result = subprocess.run(
+        [
+            curl,
+            "-L",
+            "-sS",
+            "-o",
+            os.devnull,
+            "--connect-timeout",
+            str(min(timeout, 10)),
+            "--max-time",
+            str(timeout),
+            "--socks5-hostname",
+            f"127.0.0.1:{proxy_port}",
+            "-w",
+            "%{http_code}\t%{time_total}\t%{speed_download}",
+            url,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip().splitlines()
+        return False, "-", message[-1] if message else f"curl exit {result.returncode}", 0.0
+
+    parts = result.stdout.strip().split("\t")
+    if len(parts) != 3:
+        return False, "-", "bad curl output", 0.0
+
+    status, total_time, speed = parts
+    try:
+        latency_ms = f"{float(total_time) * 1000:.0f}"
+    except ValueError:
+        latency_ms = "-"
+    try:
+        speed_value = float(speed)
+    except ValueError:
+        speed_value = 0.0
+    ok = status.startswith(("2", "3"))
+    return ok, status, latency_ms, speed_value
+
+
+def command_test(
+    paths: Paths,
+    target: str,
+    test_url: str,
+    speed_url: str,
+    timeout: int,
+    include_speed: bool,
+) -> int:
+    locations = resolve_locations(paths, target)
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return 1
+
+    if not shutil.which("curl"):
+        print_warning("curl is required for tunnel testing. Re-run the bootstrap installer or install curl.")
+        return 1
+
+    print(Color.bold(Color.cyan("xPsiphon Ping And Speed Test")))
+    print(f"Ping URL:  {test_url}")
+    if include_speed:
+        print(f"Speed URL: {speed_url}")
+    print()
+
+    rows: list[list[str]] = []
+    failures = 0
+    for location in locations:
+        if not location.socks_port.isdigit():
+            rows.append([location.code, "-", "-", "-", "-", Color.red("invalid SOCKS port")])
+            failures += 1
+            continue
+
+        port = int(location.socks_port)
+        if not can_connect("127.0.0.1", port):
+            rows.append([location.code, str(port), "-", "-", "-", Color.yellow("not listening")])
+            failures += 1
+            continue
+
+        ok, status, latency_ms, _ = curl_probe(port, test_url, timeout)
+        if not ok:
+            rows.append([location.code, str(port), status, "-", "-", Color.red(latency_ms)])
+            failures += 1
+            continue
+
+        speed_text = "-"
+        if include_speed:
+            speed_ok, speed_status, _, speed_value = curl_probe(port, speed_url, timeout)
+            if speed_ok:
+                speed_text = speed_human(speed_value)
+            else:
+                speed_text = Color.red(speed_status)
+                failures += 1
+
+        rows.append([location.code, str(port), status, f"{latency_ms} ms", speed_text, Color.green("ok")])
+
+    print(table(["Loc", "SOCKS", "Code", "Ping", "Speed", "Result"], rows))
+    print()
+    print("Note: ping is HTTPS request latency through the SOCKS proxy, not ICMP ping.")
+    return 0 if failures == 0 else 1
+
+
+def start_location(paths: Paths, location: Location) -> bool:
+    ensure_dirs(paths)
+    pids = running_pids(paths, location)
+    if pids:
+        print(f"{location.code}: already running (PID {', '.join(str(pid) for pid in pids)})")
+        return False
+
+    if not paths.psiphon_bin.exists():
+        raise SystemExit(
+            f"Psiphon binary not found: {paths.psiphon_bin}\n"
+            f"Install everything with:\n  {ONE_LINE_INSTALL}"
+        )
+    if not os.access(paths.psiphon_bin, os.X_OK):
+        raise SystemExit(
+            f"Psiphon binary is not executable: {paths.psiphon_bin}\n"
+            f"Fix by running:\n  chmod +x {paths.psiphon_bin}\n"
+            f"or reinstall with:\n  {ONE_LINE_INSTALL}"
+        )
+
+    root = data_root(paths, location)
+    root.mkdir(parents=True, exist_ok=True)
+    log_path = log_file(paths, location)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        str(paths.psiphon_bin),
+        "-config",
+        str(location.config_path),
+        "-dataRootDirectory",
+        str(root),
+    ]
+    with log_path.open("ab", buffering=0) as log_handle:
+        process = subprocess.Popen(
+            args,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    pid_file(paths, location).write_text(f"{process.pid}\n", encoding="utf-8")
+    print(f"{location.code}: started PID {process.pid} | log {log_path}")
+    return True
+
+
+def stop_pid(pid: int, timeout: float = 8.0) -> bool:
+    if not process_alive(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        raise SystemExit(f"permission denied stopping PID {pid}: {exc}") from exc
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not process_alive(pid):
+            return True
+        time.sleep(0.2)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    return not process_alive(pid)
+
+
+def stop_location(paths: Paths, location: Location) -> bool:
+    pids = running_pids(paths, location)
+    if not pids:
+        pid_file(paths, location).unlink(missing_ok=True)
+        print(f"{location.code}: already stopped")
+        return False
+
+    stopped: list[int] = []
+    for pid in pids:
+        if stop_pid(pid):
+            stopped.append(pid)
+    pid_file(paths, location).unlink(missing_ok=True)
+    if stopped:
+        print(f"{location.code}: stopped PID {', '.join(str(pid) for pid in stopped)}")
+        return True
+    print(f"{location.code}: no processes stopped")
+    return False
+
+
+def restart_location(paths: Paths, location: Location) -> None:
+    stop_location(paths, location)
+    start_location(paths, location)
+
+
+def command_start(paths: Paths, target: str) -> int:
+    require_root("starting Psiphon instances")
+    locations = resolve_locations(paths, target)
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return 1
+    changed = False
+    for location in locations:
+        changed = start_location(paths, location) or changed
+    return 0 if changed or target.lower() != "all" else 0
+
+
+def command_stop(paths: Paths, target: str) -> int:
+    require_root("stopping Psiphon instances")
+    locations = resolve_locations(paths, target)
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return 1
+    for location in locations:
+        stop_location(paths, location)
+    return 0
+
+
+def command_restart(paths: Paths, target: str) -> int:
+    require_root("restarting Psiphon instances")
+    locations = resolve_locations(paths, target)
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return 1
+    for location in locations:
+        restart_location(paths, location)
+    return 0
+
+
+def tail_file(path: Path, lines: int = 80) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            block_size = 4096
+            data = b""
+            while end > 0 and data.count(b"\n") <= lines:
+                read_size = min(block_size, end)
+                end -= read_size
+                handle.seek(end)
+                data = handle.read(read_size) + data
+        return data.decode("utf-8", errors="replace").splitlines()[-lines:]
+    except FileNotFoundError:
+        raise SystemExit(f"log file does not exist yet: {path}")
+    except OSError as exc:
+        raise SystemExit(f"cannot read log file {path}: {exc}") from exc
+
+
+def follow_file(path: Path) -> None:
+    print(f"Following {path}. Press Ctrl-C to stop.")
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(0, os.SEEK_END)
+            while True:
+                line = handle.readline()
+                if line:
+                    print(line, end="")
+                else:
+                    time.sleep(0.5)
+    except KeyboardInterrupt:
+        print()
+    except FileNotFoundError:
+        raise SystemExit(f"log file does not exist yet: {path}")
+    except OSError as exc:
+        raise SystemExit(f"cannot follow log file {path}: {exc}") from exc
+
+
+def command_logs(paths: Paths, target: str, follow: bool, lines: int) -> int:
+    locations = resolve_locations(paths, target)
+    if len(locations) != 1:
+        raise SystemExit("logs command requires a single location, not all")
+    path = log_file(paths, locations[0])
+    if follow:
+        follow_file(path)
+        return 0
+    print(f"==> {path} <==")
+    for line in tail_file(path, lines=lines):
+        print(line)
+    return 0
+
+
+def service_unit(paths: Paths) -> str:
+    environment_lines = [
+        f'Environment="XPSIPHON_BIN={paths.psiphon_bin}"',
+        f'Environment="XPSIPHON_CONF_DIR={paths.conf_dir}"',
+        f'Environment="XPSIPHON_DATA_DIR={paths.data_dir}"',
+        f'Environment="XPSIPHON_LOG_DIR={paths.log_dir}"',
+        f'Environment="XPSIPHON_RUN_DIR={paths.run_dir}"',
+    ]
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=xPsiphon multi-location manager",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            "RemainAfterExit=yes",
+            *environment_lines,
+            f"ExecStart={paths.command_path} start all",
+            f"ExecStop={paths.command_path} stop all",
+            "TimeoutStartSec=120",
+            "TimeoutStopSec=120",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        ]
+    )
+
+
+def systemctl(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["systemctl", *args], check=check, text=True, capture_output=True)
+
+
+def systemd_available() -> bool:
+    return shutil.which("systemctl") is not None and Path("/run/systemd/system").exists()
+
+
+def autostart_status(paths: Paths) -> tuple[bool, str]:
+    if not paths.service_path.exists():
+        return False, "service file missing"
+    if not systemd_available():
+        return False, "systemd unavailable"
+    result = systemctl("is-enabled", SERVICE_NAME)
+    state = result.stdout.strip() or result.stderr.strip() or "unknown"
+    return result.returncode == 0, state
+
+
+def autostart_on(paths: Paths) -> int:
+    require_root("enabling autostart")
+    if not systemd_available():
+        raise SystemExit("systemd is not available on this host")
+    paths.service_path.write_text(service_unit(paths), encoding="utf-8")
+    result = systemctl("daemon-reload")
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or "systemctl daemon-reload failed")
+    result = systemctl("enable", SERVICE_NAME)
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or f"systemctl enable {SERVICE_NAME} failed")
+    print(f"autostart enabled: {paths.service_path}")
+    return 0
+
+
+def autostart_off(paths: Paths) -> int:
+    require_root("disabling autostart")
+    if not systemd_available():
+        raise SystemExit("systemd is not available on this host")
+    systemctl("disable", SERVICE_NAME)
+    if paths.service_path.exists():
+        paths.service_path.unlink()
+    result = systemctl("daemon-reload")
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or "systemctl daemon-reload failed")
+    print("autostart disabled")
+    return 0
+
+
+def command_autostart(paths: Paths, action: str) -> int:
+    action = action.lower()
+    if action == "status":
+        enabled, state = autostart_status(paths)
+        label = Color.green("enabled") if enabled else Color.red("disabled")
+        print(f"autostart: {label} ({state})")
+        print(f"service: {paths.service_path}")
+        return 0
+    if action == "on":
+        return autostart_on(paths)
+    if action == "off":
+        return autostart_off(paths)
+    if action == "toggle":
+        enabled, _ = autostart_status(paths)
+        return autostart_off(paths) if enabled else autostart_on(paths)
+    raise SystemExit(f"unknown autostart action: {action}")
+
+
+def doctor(paths: Paths) -> int:
+    failures = 0
+    print(Color.bold(Color.cyan("xPsiphon Doctor")))
+    checks: list[tuple[str, bool, str]] = []
+    checks.append(("Python", sys.version_info >= (3, 10), sys.version.split()[0]))
+    checks.append(("Psiphon binary exists", paths.psiphon_bin.exists(), str(paths.psiphon_bin)))
+    checks.append(("Psiphon binary executable", os.access(paths.psiphon_bin, os.X_OK), str(paths.psiphon_bin)))
+    checks.append(("Config directory exists", paths.conf_dir.is_dir(), str(paths.conf_dir)))
+    locations = discover_locations(paths)
+    checks.append(("Config files found", bool(locations), str(len(locations))))
+    checks.append(("curl available", shutil.which("curl") is not None, shutil.which("curl") or "missing"))
+    checks.append(("systemctl available", shutil.which("systemctl") is not None, shutil.which("systemctl") or "missing"))
+    checks.append(("systemd running", systemd_available(), "/run/systemd/system"))
+
+    for label, ok, detail in checks:
+        state = Color.green("OK") if ok else Color.red("FAIL")
+        print(f"{pad_visible(state, 8)}  {label:<28} {detail}")
+        if not ok and label not in {"systemctl available", "systemd running"}:
+            failures += 1
+
+    if locations:
+        print()
+        rows = [[loc.code, location_kind(loc), loc.socks_port, loc.http_port, str(loc.config_path)] for loc in locations]
+        print(table(["Loc", "Type", "SOCKS", "HTTP", "Config"], rows))
+    if failures:
+        print()
+        print_warning(f"Run the bootstrap installer if this is a fresh server:\n  {ONE_LINE_INSTALL}")
+    return 0 if failures == 0 else 1
+
+
+def clear_screen() -> None:
+    if sys.stdout.isatty():
+        os.system("clear")
+
+
+def prompt_location(paths: Paths) -> Location | None:
+    locations = discover_locations(paths)
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return None
+
+    print(table(["#", "Loc", "Type", "SOCKS", "HTTP"], [[str(i + 1), loc.code, location_kind(loc), loc.socks_port, loc.http_port] for i, loc in enumerate(locations)]))
+    value = input("Location number/code: ").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        index = int(value) - 1
+        if 0 <= index < len(locations):
+            return locations[index]
+    code = normalize_code(value)
+    for location in locations:
+        if location.code == code:
+            return location
+    print_error(f"unknown location: {value}")
+    return None
+
+
+def pause() -> None:
+    try:
+        input("\nPress Enter to continue...")
+    except EOFError:
+        pass
+
+
+def menu_header(paths: Paths) -> None:
+    enabled, state = autostart_status(paths)
+    autostart = Color.green("on") if enabled else Color.yellow(f"off ({state})")
+    locations = discover_locations(paths)
+    _, total_cpu, total_mem, running_count = status_rows(paths, locations) if locations else ([], 0.0, 0.0, 0)
+    status = Color.green(f"{running_count} running") if running_count else Color.yellow("0 running")
+    print(Color.bold(Color.cyan("xPsiphon Terminal Panel")))
+    print(f"Status:  {status} | CPU {total_cpu:.1f}% | MEM {total_mem:.1f}%")
+    print(f"Configs: {Color.cyan(str(paths.conf_dir))}")
+    print(f"Logs:    {Color.cyan(str(paths.log_dir))}")
+    print(f"Auto:    {autostart}")
+    print(f"Default: AUTO uses SOCKS 127.0.0.1:1080 and HTTP 127.0.0.1:8080")
+    print()
+
+
+def interactive(paths: Paths) -> int:
+    while True:
+        clear_screen()
+        menu_header(paths)
+        print(f"{Color.cyan('1)')} Full status")
+        print(f"{Color.cyan('2)')} Start AUTO location")
+        print(f"{Color.cyan('3)')} Start location")
+        print(f"{Color.cyan('4)')} Stop location")
+        print(f"{Color.cyan('5)')} Start all")
+        print(f"{Color.cyan('6)')} Stop all")
+        print(f"{Color.cyan('7)')} Restart location")
+        print(f"{Color.cyan('8)')} Tail location log")
+        print(f"{Color.cyan('9)')} Toggle autostart")
+        print(f"{Color.cyan('f)')} Firewall / open ports check")
+        print(f"{Color.cyan('t)')} Ping / speed test")
+        print(f"{Color.cyan('d)')} Doctor")
+        print(f"{Color.cyan('0)')} Exit")
+        choice = input("\nSelect: ").strip().lower()
+
+        try:
+            if choice in {"0", "q", "quit", "exit"}:
+                return 0
+            if choice == "1":
+                clear_screen()
+                print_status(paths)
+                pause()
+            elif choice == "2":
+                command_start(paths, "AUTO")
+                pause()
+            elif choice == "3":
+                location = prompt_location(paths)
+                if location:
+                    command_start(paths, location.code)
+                pause()
+            elif choice == "4":
+                location = prompt_location(paths)
+                if location:
+                    command_stop(paths, location.code)
+                pause()
+            elif choice == "5":
+                command_start(paths, "all")
+                pause()
+            elif choice == "6":
+                command_stop(paths, "all")
+                pause()
+            elif choice == "7":
+                location = prompt_location(paths)
+                if location:
+                    command_restart(paths, location.code)
+                pause()
+            elif choice == "8":
+                location = prompt_location(paths)
+                if location:
+                    command_logs(paths, location.code, follow=True, lines=80)
+                pause()
+            elif choice == "9":
+                command_autostart(paths, "toggle")
+                pause()
+            elif choice == "f":
+                clear_screen()
+                command_firewall(paths)
+                pause()
+            elif choice == "t":
+                clear_screen()
+                command_test(paths, "all", DEFAULT_TEST_URL, DEFAULT_SPEED_URL, 20, True)
+                pause()
+            elif choice == "d":
+                clear_screen()
+                doctor(paths)
+                pause()
+            else:
+                print_error("invalid menu selection")
+                pause()
+        except SystemExit as exc:
+            if str(exc):
+                print_error(str(exc))
+            pause()
+        except KeyboardInterrupt:
+            print()
+            pause()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Manage Psiphon multi-location instances.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """
+            Examples:
+              xpsiphon
+              sudo xpsiphon start US
+              sudo xpsiphon stop all
+              xpsiphon status
+              xpsiphon logs US -f
+              sudo xpsiphon autostart toggle
+            """
+        ).strip(),
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("status", help="show full server and Psiphon status")
+
+    start = subparsers.add_parser("start", help="start one location or all")
+    start.add_argument("target", help="location code or all")
+
+    stop = subparsers.add_parser("stop", help="stop one location or all")
+    stop.add_argument("target", help="location code or all")
+
+    restart = subparsers.add_parser("restart", help="restart one location or all")
+    restart.add_argument("target", help="location code or all")
+
+    logs = subparsers.add_parser("logs", help="show or follow one location log")
+    logs.add_argument("target", help="location code")
+    logs.add_argument("-f", "--follow", action="store_true", help="follow appended log output")
+    logs.add_argument("-n", "--lines", type=int, default=80, help="number of lines to show")
+
+    autostart = subparsers.add_parser("autostart", help="manage systemd autostart")
+    autostart.add_argument("action", choices=["status", "on", "off", "toggle"], help="autostart action")
+
+    test = subparsers.add_parser("test", help="test tunnel latency and download speed through SOCKS proxies")
+    test.add_argument("target", nargs="?", default="all", help="location code or all")
+    test.add_argument("--url", default=os.environ.get("XPSIPHON_TEST_URL", DEFAULT_TEST_URL), help="URL for latency test")
+    test.add_argument("--speed-url", default=os.environ.get("XPSIPHON_SPEED_URL", DEFAULT_SPEED_URL), help="URL for speed test")
+    test.add_argument("--timeout", type=int, default=20, help="curl timeout per request")
+    test.add_argument("--no-speed", action="store_true", help="only test latency/connectivity")
+
+    speed = subparsers.add_parser("speed", help="alias for test")
+    speed.add_argument("target", nargs="?", default="all", help="location code or all")
+    speed.add_argument("--url", default=os.environ.get("XPSIPHON_TEST_URL", DEFAULT_TEST_URL), help="URL for latency test")
+    speed.add_argument("--speed-url", default=os.environ.get("XPSIPHON_SPEED_URL", DEFAULT_SPEED_URL), help="URL for speed test")
+    speed.add_argument("--timeout", type=int, default=20, help="curl timeout per request")
+    speed.add_argument("--no-speed", action="store_true", help="only test latency/connectivity")
+
+    subparsers.add_parser("doctor", help="check host prerequisites and configuration")
+    subparsers.add_parser("firewall", help="check configured ports against local listeners and common firewalls")
+    subparsers.add_parser("ports", help="alias for firewall")
+    subparsers.add_parser("locations", help="list discovered locations")
+    return parser
+
+
+def command_locations(paths: Paths) -> int:
+    locations = discover_locations(paths)
+    if not locations:
+        print_warning(f"no configs found in {paths.conf_dir}")
+        return 1
+    rows = [[loc.code, location_kind(loc), loc.socks_port, loc.http_port, str(loc.config_path)] for loc in locations]
+    print(table(["Loc", "Type", "SOCKS", "HTTP", "Config"], rows))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    paths = build_paths()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command is None:
+            return interactive(paths)
+        if args.command == "status":
+            return print_status(paths)
+        if args.command == "start":
+            return command_start(paths, args.target)
+        if args.command == "stop":
+            return command_stop(paths, args.target)
+        if args.command == "restart":
+            return command_restart(paths, args.target)
+        if args.command == "logs":
+            return command_logs(paths, args.target, args.follow, max(args.lines, 1))
+        if args.command == "autostart":
+            return command_autostart(paths, args.action)
+        if args.command in {"test", "speed"}:
+            return command_test(paths, args.target, args.url, args.speed_url, max(args.timeout, 1), not args.no_speed)
+        if args.command == "doctor":
+            return doctor(paths)
+        if args.command in {"firewall", "ports"}:
+            return command_firewall(paths)
+        if args.command == "locations":
+            return command_locations(paths)
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        print()
+        return 130
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print_error(str(exc))
+        return 1
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

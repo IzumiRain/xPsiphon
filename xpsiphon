@@ -18,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -25,7 +26,9 @@ from pathlib import Path
 from typing import Sequence
 
 
+VERSION = "2.0.0"
 APP_NAME = "xpsiphon"
+SHORT_NAME = "xp"
 SERVICE_NAME = "xpsiphon.service"
 DEFAULT_BIN = "/etc/psiphon/psiphon-tunnel-core-x86_64"
 DEFAULT_CONF_DIR = "/etc/psiphon/configs"
@@ -33,7 +36,11 @@ DEFAULT_DATA_DIR = "/tmp/psiphon"
 DEFAULT_LOG_DIR = "/var/log/xpsiphon"
 DEFAULT_RUN_DIR = "/run/xpsiphon"
 DEFAULT_SERVICE_PATH = f"/etc/systemd/system/{SERVICE_NAME}"
-ONE_LINE_INSTALL = "bash <(curl -fsSL https://raw.githubusercontent.com/IzumiRain/xPsiphon/main/install.sh)"
+GITHUB_REPO = os.environ.get("XPSIPHON_GITHUB_REPO", "IzumiRain/xPsiphon")
+GITHUB_REF = os.environ.get("XPSIPHON_GITHUB_REF", "main")
+RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_REF}"
+INSTALLER_URL = f"{RAW_BASE}/install.sh"
+ONE_LINE_INSTALL = f"bash <(curl -fsSL {INSTALLER_URL})"
 DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
 DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=1048576"
 
@@ -1071,7 +1078,7 @@ def command_autostart(paths: Paths, action: str) -> int:
 
 def doctor(paths: Paths) -> int:
     failures = 0
-    print(Color.bold(Color.cyan("xPsiphon Doctor")))
+    print(Color.bold(Color.cyan(f"xPsiphon Doctor  v{VERSION}")))
     checks: list[tuple[str, bool, str]] = []
     checks.append(("Python", sys.version_info >= (3, 10), sys.version.split()[0]))
     checks.append(("Psiphon binary exists", paths.psiphon_bin.exists(), str(paths.psiphon_bin)))
@@ -1139,7 +1146,7 @@ def menu_header(paths: Paths) -> None:
     locations = discover_locations(paths)
     _, total_cpu, total_mem, running_count = status_rows(paths, locations) if locations else ([], 0.0, 0.0, 0)
     status = Color.green(f"{running_count} running") if running_count else Color.yellow("0 running")
-    print(Color.bold(Color.cyan("xPsiphon Terminal Panel")))
+    print(Color.bold(Color.cyan(f"xPsiphon Terminal Panel  v{VERSION}")))
     print(f"Status:  {status} | CPU {total_cpu:.1f}% | MEM {total_mem:.1f}%")
     print(f"Configs: {Color.cyan(str(paths.conf_dir))}")
     print(f"Logs:    {Color.cyan(str(paths.log_dir))}")
@@ -1161,9 +1168,12 @@ def interactive(paths: Paths) -> int:
         print(f"{Color.cyan('7)')} Restart location")
         print(f"{Color.cyan('8)')} Tail location log")
         print(f"{Color.cyan('9)')} Toggle autostart")
+        print(f"{Color.cyan('p)')} Change location port")
         print(f"{Color.cyan('f)')} Firewall / open ports check")
         print(f"{Color.cyan('t)')} Ping / speed test")
         print(f"{Color.cyan('d)')} Doctor")
+        print(f"{Color.cyan('u)')} Update xPsiphon")
+        print(f"{Color.cyan('x)')} Uninstall xPsiphon")
         print(f"{Color.cyan('0)')} Exit")
         choice = input("\nSelect: ").strip().lower()
 
@@ -1206,6 +1216,10 @@ def interactive(paths: Paths) -> int:
             elif choice == "9":
                 command_autostart(paths, "toggle")
                 pause()
+            elif choice == "p":
+                require_root("changing location ports")
+                prompt_port_change(paths)
+                pause()
             elif choice == "f":
                 clear_screen()
                 command_firewall(paths)
@@ -1217,6 +1231,18 @@ def interactive(paths: Paths) -> int:
             elif choice == "d":
                 clear_screen()
                 doctor(paths)
+                pause()
+            elif choice == "u":
+                clear_screen()
+                require_root("updating xPsiphon")
+                command_update(paths, False, False)
+                pause()
+            elif choice == "x":
+                clear_screen()
+                require_root("uninstalling xPsiphon")
+                if command_uninstall(paths, purge=False, assume_yes=False) == 0:
+                    print("\nExiting panel.")
+                    return 0
                 pause()
             else:
                 print_error("invalid menu selection")
@@ -1243,6 +1269,9 @@ def build_parser() -> argparse.ArgumentParser:
               sudo xpsiphon stop all
               xpsiphon status
               xpsiphon logs US -f
+              sudo xpsiphon port US --socks 1201 --http 8201
+              sudo xpsiphon update
+              sudo xpsiphon uninstall
               sudo xpsiphon autostart toggle
             """
         ).strip(),
@@ -1282,10 +1311,24 @@ def build_parser() -> argparse.ArgumentParser:
     speed.add_argument("--timeout", type=int, default=20, help="curl timeout per request")
     speed.add_argument("--no-speed", action="store_true", help="only test latency/connectivity")
 
+    port = subparsers.add_parser("port", help="change the SOCKS and/or HTTP port for one location")
+    port.add_argument("target", help="location code, e.g. US")
+    port.add_argument("--socks", type=int, default=None, help="new SOCKS proxy port")
+    port.add_argument("--http", type=int, default=None, help="new HTTP proxy port")
+
+    update = subparsers.add_parser("update", help="update xPsiphon in place without disrupting running tunnels")
+    update.add_argument("--force-psiphon", action="store_true", help="also re-download the Psiphon core binary")
+    update.add_argument("--force-configs", action="store_true", help="overwrite existing configs (resets customized ports)")
+
+    uninstall = subparsers.add_parser("uninstall", help="remove xPsiphon from this system")
+    uninstall.add_argument("--purge", action="store_true", help="also delete configs and the Psiphon core binary")
+    uninstall.add_argument("-y", "--yes", action="store_true", help="do not prompt for confirmation")
+
     subparsers.add_parser("doctor", help="check host prerequisites and configuration")
     subparsers.add_parser("firewall", help="check configured ports against local listeners and common firewalls")
     subparsers.add_parser("ports", help="alias for firewall")
     subparsers.add_parser("locations", help="list discovered locations")
+    subparsers.add_parser("version", help="show the xPsiphon version")
     return parser
 
 
@@ -1296,6 +1339,290 @@ def command_locations(paths: Paths) -> int:
         return 1
     rows = [[loc.code, location_kind(loc), loc.socks_port, loc.http_port, str(loc.config_path)] for loc in locations]
     print(table(["Loc", "Type", "SOCKS", "HTTP", "Config"], rows))
+    return 0
+
+
+def valid_port(value: int) -> bool:
+    return 1 <= value <= 65535
+
+
+def port_conflicts(
+    paths: Paths,
+    location: Location,
+    socks_port: int | None,
+    http_port: int | None,
+) -> list[str]:
+    """Return human-readable conflicts for the requested ports.
+
+    Checks the two new ports against each other and against every OTHER
+    location's SOCKS and HTTP ports so two locations never share a port.
+    """
+    problems: list[str] = []
+    new_socks = socks_port if socks_port is not None else (int(location.socks_port) if location.socks_port.isdigit() else None)
+    new_http = http_port if http_port is not None else (int(location.http_port) if location.http_port.isdigit() else None)
+
+    if new_socks is not None and new_http is not None and new_socks == new_http:
+        problems.append(f"SOCKS and HTTP cannot both use port {new_socks}")
+
+    for other in discover_locations(paths):
+        if other.code == location.code:
+            continue
+        used: dict[int, str] = {}
+        if other.socks_port.isdigit():
+            used[int(other.socks_port)] = f"{other.code} SOCKS"
+        if other.http_port.isdigit():
+            used[int(other.http_port)] = f"{other.code} HTTP"
+        for new_port, label in ((new_socks, "SOCKS"), (new_http, "HTTP")):
+            if new_port is not None and new_port in used:
+                problems.append(f"{label} port {new_port} already used by {used[new_port]}")
+    return problems
+
+
+def write_location_ports(
+    location: Location,
+    socks_port: int | None,
+    http_port: int | None,
+) -> None:
+    """Persist new port values to the location's JSON config, preserving key order."""
+    data = read_json_config(location.config_path)
+    if socks_port is not None:
+        data["LocalSocksProxyPort"] = socks_port
+    if http_port is not None:
+        data["LocalHttpProxyPort"] = http_port
+    location.config_path.write_text(
+        json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+    )
+
+
+def apply_location_ports(
+    paths: Paths,
+    location: Location,
+    socks_port: int | None,
+    http_port: int | None,
+) -> int:
+    if socks_port is None and http_port is None:
+        print_error("provide a new --socks and/or --http port")
+        return 1
+
+    for label, value in (("SOCKS", socks_port), ("HTTP", http_port)):
+        if value is not None and not valid_port(value):
+            print_error(f"{label} port {value} is out of range (1-65535)")
+            return 1
+        if value is not None and value < 1024:
+            print_warning(f"{label} port {value} is privileged (<1024); binding may need root")
+
+    problems = port_conflicts(paths, location, socks_port, http_port)
+    if problems:
+        for problem in problems:
+            print_error(problem)
+        return 1
+
+    old_socks, old_http = location.socks_port, location.http_port
+    write_location_ports(location, socks_port, http_port)
+
+    new_socks = str(socks_port) if socks_port is not None else old_socks
+    new_http = str(http_port) if http_port is not None else old_http
+    print(f"{location.code}: SOCKS {old_socks} -> {new_socks} | HTTP {old_http} -> {new_http}")
+    print(f"Updated {location.config_path}")
+
+    if running_pids(paths, location):
+        print_warning(f"{location.code} is running; restart it to apply the new ports:")
+        print(f"  sudo {APP_NAME} restart {location.code}")
+    return 0
+
+
+def command_port(paths: Paths, target: str, socks_port: int | None, http_port: int | None) -> int:
+    locations = resolve_locations(paths, target)
+    if len(locations) != 1:
+        raise SystemExit("port command requires a single location code, not all")
+    return apply_location_ports(paths, locations[0], socks_port, http_port)
+
+
+def prompt_port_change(paths: Paths) -> None:
+    location = prompt_location(paths)
+    if not location:
+        return
+    print(f"\n{location.code} current ports: SOCKS {location.socks_port} | HTTP {location.http_port}")
+    print("Leave a field blank to keep its current value.")
+
+    def ask(label: str, current: str) -> int | None:
+        value = input(f"New {label} port [{current}]: ").strip()
+        if not value:
+            return None
+        if not value.isdigit():
+            print_error(f"{label} port must be a number")
+            raise ValueError(value)
+        return int(value)
+
+    try:
+        socks_port = ask("SOCKS", location.socks_port)
+        http_port = ask("HTTP", location.http_port)
+    except ValueError:
+        return
+    apply_location_ports(paths, location, socks_port, http_port)
+
+
+def command_version() -> int:
+    print(f"xPsiphon {VERSION}")
+    print(f"source: {GITHUB_REPO}@{GITHUB_REF}")
+    return 0
+
+
+def command_update(paths: Paths, force_psiphon: bool, force_configs: bool) -> int:
+    """Update xPsiphon in place by re-running the bootstrap installer.
+
+    This is intentionally non-destructive: the installer keeps existing location
+    configs (so customized ports survive), keeps the Psiphon core binary unless
+    --force-psiphon is given, and never stops running tunnels or changes the
+    autostart state. New location configs are simply added.
+    """
+    require_root("updating xPsiphon")
+    if not shutil.which("curl"):
+        raise SystemExit("curl is required to update. Install curl and retry.")
+    if not shutil.which("bash"):
+        raise SystemExit("bash is required to update.")
+
+    print(Color.bold(Color.cyan("xPsiphon Update")))
+    print(f"Installed version: {VERSION}")
+    print(f"Installer:         {INSTALLER_URL}")
+    print("Existing configs, customized ports, and running tunnels are preserved.")
+    print()
+
+    before = {loc.code for loc in discover_locations(paths)}
+
+    fd, tmp_installer = tempfile.mkstemp(prefix="xpsiphon-install-", suffix=".sh")
+    os.close(fd)
+    try:
+        code, out, err = run_text(
+            ["curl", "-fsSL", "--retry", "3", "--connect-timeout", "20", INSTALLER_URL, "-o", tmp_installer]
+        )
+        if code != 0:
+            detail = err.strip() or out.strip() or f"curl exit {code}"
+            raise SystemExit(f"failed to download installer from {INSTALLER_URL}: {detail}")
+
+        installer_args = ["bash", tmp_installer]
+        if force_psiphon:
+            installer_args.append("--force-psiphon")
+        if force_configs:
+            installer_args.append("--force-configs")
+
+        result = subprocess.run(installer_args, check=False)
+        if result.returncode != 0:
+            raise SystemExit(f"installer exited with code {result.returncode}")
+    finally:
+        try:
+            os.unlink(tmp_installer)
+        except OSError:
+            pass
+
+    after = {loc.code for loc in discover_locations(paths)}
+    added = sorted(after - before)
+
+    print()
+    print(Color.green("Update complete."))
+    if added:
+        print(f"New locations added: {', '.join(added)}")
+        print(f"They are not started automatically. Start them when ready:")
+        print(f"  sudo {APP_NAME} start all")
+    print(f"Confirm the new version with: {APP_NAME} version")
+    return 0
+
+
+def uninstall_command_paths(paths: Paths) -> list[Path]:
+    """Every path the xpsiphon/xp commands may live at, de-duplicated."""
+    candidates: list[Path] = [Path(paths.command_path)]
+    for name in (APP_NAME, SHORT_NAME):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+        candidates.append(Path(f"/usr/local/bin/{name}"))
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def command_uninstall(paths: Paths, purge: bool, assume_yes: bool) -> int:
+    require_root("uninstalling xPsiphon")
+
+    psiphon_dir = paths.psiphon_bin.parent
+    print(Color.bold(Color.cyan("xPsiphon Uninstall")))
+    print("This will:")
+    print("  - stop all running Psiphon locations")
+    print(f"  - disable and remove {SERVICE_NAME}")
+    print(f"  - remove the {APP_NAME} and {SHORT_NAME} commands")
+    print(f"  - remove runtime dirs: {paths.run_dir}, {paths.log_dir}, {paths.data_dir}")
+    if purge:
+        print(Color.yellow(f"  - PURGE configs ({paths.conf_dir}) and Psiphon binary ({paths.psiphon_bin})"))
+    else:
+        print(f"  - keep configs and Psiphon binary in {psiphon_dir}")
+    print()
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            raise SystemExit("refusing to uninstall without confirmation; re-run with --yes")
+        answer = input("Type 'yes' to continue: ").strip().lower()
+        if answer not in {"yes", "y"}:
+            print("Aborted.")
+            return 1
+
+    for location in discover_locations(paths):
+        try:
+            stop_location(paths, location)
+        except SystemExit as exc:
+            print_warning(str(exc))
+
+    if systemd_available():
+        systemctl("disable", SERVICE_NAME)
+    if paths.service_path.exists():
+        try:
+            paths.service_path.unlink()
+            print(f"removed {paths.service_path}")
+        except OSError as exc:
+            print_warning(f"could not remove {paths.service_path}: {exc}")
+    if systemd_available():
+        systemctl("daemon-reload")
+
+    for command_file in uninstall_command_paths(paths):
+        try:
+            if command_file.exists() or command_file.is_symlink():
+                command_file.unlink()
+                print(f"removed {command_file}")
+        except OSError as exc:
+            print_warning(f"could not remove {command_file}: {exc}")
+
+    for directory in (paths.run_dir, paths.log_dir, paths.data_dir):
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=True)
+            print(f"removed {directory}")
+
+    if purge:
+        if paths.conf_dir.exists():
+            shutil.rmtree(paths.conf_dir, ignore_errors=True)
+            print(f"removed {paths.conf_dir}")
+        if paths.psiphon_bin.exists():
+            try:
+                paths.psiphon_bin.unlink()
+                print(f"removed {paths.psiphon_bin}")
+            except OSError as exc:
+                print_warning(f"could not remove {paths.psiphon_bin}: {exc}")
+        try:
+            if psiphon_dir.exists() and not any(psiphon_dir.iterdir()):
+                psiphon_dir.rmdir()
+                print(f"removed {psiphon_dir}")
+        except OSError:
+            pass
+
+    print()
+    print(Color.green("xPsiphon uninstalled."))
+    if not purge:
+        print(f"Configs and Psiphon binary were kept in {psiphon_dir}.")
+        print(f"Remove them too with: sudo rm -rf {psiphon_dir}")
     return 0
 
 
@@ -1321,6 +1648,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return command_autostart(paths, args.action)
         if args.command in {"test", "speed"}:
             return command_test(paths, args.target, args.url, args.speed_url, max(args.timeout, 1), not args.no_speed)
+        if args.command == "port":
+            require_root("changing location ports")
+            return command_port(paths, args.target, args.socks, args.http)
+        if args.command == "update":
+            return command_update(paths, args.force_psiphon, args.force_configs)
+        if args.command == "uninstall":
+            return command_uninstall(paths, args.purge, args.yes)
+        if args.command == "version":
+            return command_version()
         if args.command == "doctor":
             return doctor(paths)
         if args.command in {"firewall", "ports"}:

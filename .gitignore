@@ -1,0 +1,24 @@
+.plan.md
+.progress.md
+.tasks.md
+.memorys.md
+kill-p.sh
+start-5loc-only.sh
+start-21-loc.sh
+INFOS .txt
+
+# Local runtime/test artifacts
+.tmp/
+logs/
+*.log
+*.pid
+__pycache__/
+*.py[cod]
+
+# Secrets and local deployment notes
+.env
+.env.*
+*.key
+*.pem
+id_rsa*
+known_hosts

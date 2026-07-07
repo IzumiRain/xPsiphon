@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_NAME="xpsiphon"
 SHORT_NAME="xp"
+VERSION="2.0.0"
 GITHUB_REPO="${XPSIPHON_GITHUB_REPO:-IzumiRain/xPsiphon}"
 GITHUB_REF="${XPSIPHON_GITHUB_REF:-main}"
 RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_REF}"
@@ -24,6 +25,7 @@ force_configs=0
 install_psiphon=1
 force_psiphon=0
 enable_autostart=0
+offline=0
 original_args=("$@")
 
 banner() {
@@ -32,7 +34,7 @@ banner() {
   local text pad left right
   printf '# %s\n' "${line}"
   for text in \
-    "xPsiphon Installer - By IzumiRain" \
+    "xPsiphon Installer v${VERSION} - By IzumiRain" \
     "Psiphon core + AUTO/country configs + terminal panel" \
     "https://github.com/IzumiRain/xPsiphon"
   do
@@ -63,6 +65,9 @@ Options:
   --skip-psiphon      Do not install/download the Psiphon core binary
   --force-psiphon     Re-download the Psiphon core binary even if it exists
   --enable-autostart  Enable xpsiphon.service after install
+  --offline           Install without network: use the xpsiphon script and the
+                      Psiphon binary placed next to this installer, and do not
+                      run apt.
   -h, --help          Show this help
 USAGE
 }
@@ -84,6 +89,9 @@ while [[ $# -gt 0 ]]; do
     --enable-autostart)
       enable_autostart=1
       ;;
+    --offline)
+      offline=1
+      ;;
     -h|--help)
       usage
       exit 0
@@ -100,12 +108,13 @@ done
 if [[ "${EUID}" -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     echo "[xPsiphon] Root privileges are required. Re-running installer with sudo..."
-    tmp_installer="$(mktemp)"
     if [[ -f "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != /dev/fd/* ]]; then
-      cp "${BASH_SOURCE[0]}" "${tmp_installer}"
-    else
-      curl -fsSL "${INSTALLER_URL}" -o "${tmp_installer}"
+      # Re-run this same file in place so bundled files (offline install) stay
+      # reachable next to it.
+      exec sudo bash "${BASH_SOURCE[0]}" "${original_args[@]}"
     fi
+    tmp_installer="$(mktemp)"
+    curl -fsSL "${INSTALLER_URL}" -o "${tmp_installer}"
     exec sudo bash "${tmp_installer}" "${original_args[@]}"
   fi
   echo "This installer must run as root. Re-run with sudo or as root." >&2
@@ -131,6 +140,11 @@ need_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Directory this installer lives in, so we can find files placed next to it.
+source_dir() {
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd
+}
+
 install_packages() {
   local packages=()
   need_command curl || packages+=("curl")
@@ -140,6 +154,10 @@ install_packages() {
 
   if [[ "${#packages[@]}" -eq 0 ]]; then
     return
+  fi
+
+  if [[ "${offline}" -eq 1 ]]; then
+    fail "Offline install needs these commands already present: ${packages[*]}. Install them and re-run."
   fi
 
   if ! need_command apt-get; then
@@ -164,9 +182,8 @@ download_file() {
 }
 
 install_manager() {
-  local script_dir
-  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd)"
-  local source_app="${script_dir}/${APP_NAME}"
+  local source_app
+  source_app="$(source_dir)/${APP_NAME}"
 
   mkdir -p "$(dirname -- "${INSTALL_PATH}")" "$(dirname -- "${SHORT_PATH}")"
 
@@ -174,6 +191,8 @@ install_manager() {
     log "Installing manager from local file: ${source_app}"
     python3 -m py_compile "${source_app}"
     install -m 0755 "${source_app}" "${INSTALL_PATH}"
+  elif [[ "${offline}" -eq 1 ]]; then
+    fail "Offline mode: manager script not found next to installer (${source_app})."
   else
     log "Downloading manager from ${APP_URL}"
     local tmp_app
@@ -198,6 +217,20 @@ install_psiphon_binary() {
   if [[ -x "${PSIPHON_BIN}" && "${force_psiphon}" -ne 1 ]]; then
     log "Psiphon core binary already exists: ${PSIPHON_BIN}"
     return
+  fi
+
+  # Offline install: use a Psiphon core binary placed next to this installer
+  # instead of downloading it.
+  local bundled_bin
+  bundled_bin="$(source_dir)/$(basename -- "${PSIPHON_BIN}")"
+  if [[ -f "${bundled_bin}" ]]; then
+    log "Installing bundled Psiphon core binary (offline): ${bundled_bin}"
+    install -m 0755 "${bundled_bin}" "${PSIPHON_BIN}"
+    return
+  fi
+
+  if [[ "${offline}" -eq 1 ]]; then
+    fail "Offline mode: bundled Psiphon binary not found at ${bundled_bin}."
   fi
 
   log "Downloading Psiphon core binary"
@@ -244,16 +277,59 @@ base = {
     "UseIndistinguishableTLS": True,
 }
 
+# Explicit (code, socks_port, http_port) table.
+#
+# Ports are FROZEN: existing users already rely on these exact port numbers
+# for their firewall rules, so they must never be reassigned when the list
+# grows. New locations always continue from the next free port instead of
+# renumbering the existing ones.
+#
+# The set of Psiphon egress regions was verified against the live Psiphon
+# client (the AvailableEgressRegions notice emitted by psiphon-tunnel-core
+# using this same propagation channel).
+#
+# BG and EE are kept for backward compatibility but are marked LEGACY: they
+# were offered by older Psiphon networks and were NOT present in the live
+# region set at the last verification. A fixed EgressRegion with no available
+# server simply fails to establish a tunnel, so they are harmless if unused.
 locations = [
-    "AUTO",
-    "AT", "BE", "BG", "CA", "CH", "CZ", "DE", "DK", "EE", "FI",
-    "FR", "GB", "IN", "IT", "JP", "NL", "NO", "PL", "RO", "SE", "US",
+    # code   socks  http   note
+    ("AUTO", 1080, 8080),   # automatic server selection (no EgressRegion)
+    ("AT",   1081, 8081),
+    ("BE",   1082, 8082),
+    ("BG",   1083, 8083),   # LEGACY: not in current live region set
+    ("CA",   1084, 8084),
+    ("CH",   1085, 8085),
+    ("CZ",   1086, 8086),
+    ("DE",   1087, 8087),
+    ("DK",   1088, 8088),
+    ("EE",   1089, 8089),   # LEGACY: not in current live region set
+    ("FI",   1090, 8090),
+    ("FR",   1091, 8091),
+    ("GB",   1092, 8092),
+    ("IN",   1093, 8093),
+    ("IT",   1094, 8094),
+    ("JP",   1095, 8095),
+    ("NL",   1096, 8096),
+    ("NO",   1097, 8097),
+    ("PL",   1098, 8098),
+    ("RO",   1099, 8099),
+    ("SE",   1100, 8100),
+    ("US",   1101, 8101),
+    # --- added 2026-07-07: verified live via AvailableEgressRegions ---
+    ("AU",   1102, 8102),
+    ("ES",   1103, 8103),
+    ("ID",   1104, 8104),
+    ("IE",   1105, 8105),
+    ("LT",   1106, 8106),
+    ("RS",   1107, 8107),
+    ("SG",   1108, 8108),
 ]
 
-for index, code in enumerate(locations):
+for code, socks_port, http_port in locations:
     data = dict(base)
-    data["LocalHttpProxyPort"] = 8080 + index
-    data["LocalSocksProxyPort"] = 1080 + index
+    data["LocalHttpProxyPort"] = http_port
+    data["LocalSocksProxyPort"] = socks_port
     if code != "AUTO":
         data["EgressRegion"] = code
 
@@ -322,6 +398,8 @@ Useful commands:
   sudo xpsiphon start AUTO
   sudo xp start AUTO
   sudo xpsiphon start all
+  sudo xpsiphon update
+  sudo xpsiphon uninstall
 
 Ports:
   AUTO SOCKS: 127.0.0.1:1080

@@ -1,0 +1,6 @@
+# Keep shell/python executables and configs LF so they run on Linux servers
+# regardless of the contributor's OS or git autocrlf setting.
+*.sh        text eol=lf
+xpsiphon    text eol=lf
+*.config    text eol=lf
+install.sh  text eol=lf

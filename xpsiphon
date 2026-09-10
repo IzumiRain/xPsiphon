@@ -861,6 +861,9 @@ def start_location(paths: Paths, location: Location) -> bool:
         "-dataRootDirectory",
         str(root),
     ]
+    env = os.environ.copy()
+    env.setdefault("GOGC", os.environ.get("XPSIPHON_GOGC", "50"))
+    env.setdefault("GOMEMLIMIT", os.environ.get("XPSIPHON_GOMEMLIMIT", "45MiB"))
     with log_path.open("ab", buffering=0) as log_handle:
         process = subprocess.Popen(
             args,
@@ -868,6 +871,7 @@ def start_location(paths: Paths, location: Location) -> bool:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
 
     pid_file(paths, location).write_text(f"{process.pid}\n", encoding="utf-8")
@@ -1009,12 +1013,16 @@ def command_logs(paths: Paths, target: str, follow: bool, lines: int) -> int:
 
 
 def service_unit(paths: Paths) -> str:
+    gogc = os.environ.get("XPSIPHON_GOGC", "50")
+    gomemlimit = os.environ.get("XPSIPHON_GOMEMLIMIT", "45MiB")
     environment_lines = [
         f'Environment="XPSIPHON_BIN={paths.psiphon_bin}"',
         f'Environment="XPSIPHON_CONF_DIR={paths.conf_dir}"',
         f'Environment="XPSIPHON_DATA_DIR={paths.data_dir}"',
         f'Environment="XPSIPHON_LOG_DIR={paths.log_dir}"',
         f'Environment="XPSIPHON_RUN_DIR={paths.run_dir}"',
+        f'Environment="GOGC={gogc}"',
+        f'Environment="GOMEMLIMIT={gomemlimit}"',
     ]
     return "\n".join(
         [

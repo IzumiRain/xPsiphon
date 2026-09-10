@@ -3,7 +3,7 @@
 xPsiphon terminal manager.
 
 Runs and manages one Psiphon tunnel-core process per location config.
-Designed for Ubuntu servers with only Python 3 standard library available.
+Designed for Linux servers (Ubuntu, Debian, RHEL, AlmaLinux, Rocky, Fedora, openSUSE, Arch, Alpine) with only Python 3 standard library available.
 """
 
 from __future__ import annotations
@@ -294,6 +294,32 @@ def running_pids(paths: Paths, location: Location) -> list[int]:
     return pids
 
 
+def proc_fallback_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
+    rows: dict[int, ProcessInfo] = {}
+    for pid in pids:
+        try:
+            status_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rss_kb = "-"
+        for line in status_text.splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    rss_kb = parts[1]
+                break
+        cmdline = read_proc_cmdline(pid)
+        rows[pid] = ProcessInfo(
+            pid=pid,
+            cpu="-",
+            mem="-",
+            rss=rss_kb,
+            elapsed="-",
+            command=cmdline,
+        )
+    return rows
+
+
 def ps_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
     if not pids:
         return {}
@@ -301,9 +327,9 @@ def ps_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
     try:
         result = subprocess.run(cmd, check=False, text=True, capture_output=True)
     except FileNotFoundError:
-        return {}
+        return proc_fallback_rows(pids)
     if result.returncode not in (0, 1):
-        return {}
+        return proc_fallback_rows(pids)
 
     rows: dict[int, ProcessInfo] = {}
     for line in result.stdout.splitlines():
@@ -320,6 +346,8 @@ def ps_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
             elapsed=parts[4],
             command=command,
         )
+    if not rows:
+        return proc_fallback_rows(pids)
     return rows
 
 
@@ -1080,7 +1108,7 @@ def doctor(paths: Paths) -> int:
     failures = 0
     print(Color.bold(Color.cyan(f"xPsiphon Doctor  v{VERSION}")))
     checks: list[tuple[str, bool, str]] = []
-    checks.append(("Python", sys.version_info >= (3, 10), sys.version.split()[0]))
+    checks.append(("Python", sys.version_info >= (3, 9), sys.version.split()[0]))
     checks.append(("Psiphon binary exists", paths.psiphon_bin.exists(), str(paths.psiphon_bin)))
     checks.append(("Psiphon binary executable", os.access(paths.psiphon_bin, os.X_OK), str(paths.psiphon_bin)))
     checks.append(("Config directory exists", paths.conf_dir.is_dir(), str(paths.conf_dir)))

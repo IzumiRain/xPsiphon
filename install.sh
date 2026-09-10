@@ -67,7 +67,7 @@ Options:
   --enable-autostart  Enable xpsiphon.service after install
   --offline           Install without network: use the xpsiphon script and the
                       Psiphon binary placed next to this installer, and do not
-                      run apt.
+                      run package manager.
   -h, --help          Show this help
 USAGE
 }
@@ -145,6 +145,14 @@ source_dir() {
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd
 }
 
+check_architecture() {
+  local arch
+  arch="$(uname -m)"
+  if [[ "${arch}" != "x86_64" && "${arch}" != "amd64" ]]; then
+    fail "xPsiphon requires an x86_64 system (detected: ${arch}). Upstream Psiphon core pre-built binaries are provided for x86_64 only."
+  fi
+}
+
 install_packages() {
   local packages=()
   need_command curl || packages+=("curl")
@@ -160,14 +168,26 @@ install_packages() {
     fail "Offline install needs these commands already present: ${packages[*]}. Install them and re-run."
   fi
 
-  if ! need_command apt-get; then
+  log "Installing prerequisites: ${packages[*]}"
+
+  if need_command apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y ca-certificates "${packages[@]}"
+  elif need_command dnf; then
+    dnf install -y ca-certificates "${packages[@]}"
+  elif need_command yum; then
+    yum install -y ca-certificates "${packages[@]}"
+  elif need_command zypper; then
+    zypper --non-interactive install -y ca-certificates "${packages[@]}"
+  elif need_command pacman; then
+    local pacman_pkgs=("${packages[@]/python3/python}")
+    pacman -Sy --noconfirm --needed ca-certificates "${pacman_pkgs[@]}"
+  elif need_command apk; then
+    apk add --no-cache ca-certificates procps "${packages[@]}"
+  else
     fail "Missing required commands: ${packages[*]}. Install them manually and re-run."
   fi
-
-  log "Installing prerequisites: ${packages[*]}"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y ca-certificates "${packages[@]}"
 }
 
 download_file() {
@@ -204,6 +224,9 @@ install_manager() {
   fi
 
   ln -sfn "${INSTALL_PATH}" "${SHORT_PATH}"
+  if command -v chcon >/dev/null 2>&1; then
+    chcon -t bin_t "${INSTALL_PATH}" 2>/dev/null || true
+  fi
   log "Installed shortcut: ${SHORT_PATH} -> ${INSTALL_PATH}"
 }
 
@@ -226,6 +249,9 @@ install_psiphon_binary() {
   if [[ -f "${bundled_bin}" ]]; then
     log "Installing bundled Psiphon core binary (offline): ${bundled_bin}"
     install -m 0755 "${bundled_bin}" "${PSIPHON_BIN}"
+    if command -v chcon >/dev/null 2>&1; then
+      chcon -t bin_t "${PSIPHON_BIN}" 2>/dev/null || true
+    fi
     return
   fi
 
@@ -235,6 +261,9 @@ install_psiphon_binary() {
 
   log "Downloading Psiphon core binary"
   download_file "${PSIPHON_CORE_URL}" "${PSIPHON_BIN}" "0755"
+  if command -v chcon >/dev/null 2>&1; then
+    chcon -t bin_t "${PSIPHON_BIN}" 2>/dev/null || true
+  fi
 }
 
 generate_configs() {
@@ -375,6 +404,7 @@ post_install_checks() {
   fi
 }
 
+check_architecture
 install_packages
 install_manager
 install_psiphon_binary

@@ -268,30 +268,41 @@ def pid_from_file(paths: Paths, location: Location) -> int | None:
     return None
 
 
-def pgrep_by_config(paths: Paths, location: Location) -> list[int]:
-    proc_root = Path("/proc")
-    if not proc_root.exists():
-        return []
+def all_running_pids_by_location(paths: Paths, locations: Sequence[Location]) -> dict[str, list[int]]:
+    result: dict[str, list[int]] = {loc.code: [] for loc in locations}
+    config_to_code = {str(loc.config_path): loc.code for loc in locations}
+    psiphon_bin_str = str(paths.psiphon_bin)
 
-    pids: list[int] = []
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if pid_matches_location(pid, paths, location):
-            pids.append(pid)
-    return sorted(pids)
+    for loc in locations:
+        f_pid = pid_from_file(paths, loc)
+        if f_pid is not None:
+            result[loc.code].append(f_pid)
+
+    proc_root = Path("/proc")
+    if proc_root.exists():
+        try:
+            for entry in proc_root.iterdir():
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                cmdline = read_proc_cmdline(pid)
+                if not cmdline or psiphon_bin_str not in cmdline:
+                    continue
+                for config_path_str, code in config_to_code.items():
+                    if config_path_str in cmdline:
+                        if pid not in result[code]:
+                            result[code].append(pid)
+                        break
+        except OSError:
+            pass
+
+    for code in result:
+        result[code].sort()
+    return result
 
 
 def running_pids(paths: Paths, location: Location) -> list[int]:
-    pids: list[int] = []
-    file_pid = pid_from_file(paths, location)
-    if file_pid is not None:
-        pids.append(file_pid)
-    for pid in pgrep_by_config(paths, location):
-        if pid not in pids:
-            pids.append(pid)
-    return pids
+    return all_running_pids_by_location(paths, [location]).get(location.code, [])
 
 
 def proc_fallback_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
@@ -492,11 +503,9 @@ def can_connect(host: str, port: int, timeout: float = 0.5) -> bool:
 
 
 def status_rows(paths: Paths, locations: Sequence[Location]) -> tuple[list[list[str]], float, float, int]:
+    location_pids = all_running_pids_by_location(paths, locations)
     all_pids: list[int] = []
-    location_pids: dict[str, list[int]] = {}
-    for location in locations:
-        pids = running_pids(paths, location)
-        location_pids[location.code] = pids
+    for pids in location_pids.values():
         all_pids.extend(pids)
 
     proc_info = ps_rows(all_pids)
@@ -966,12 +975,17 @@ def tail_file(path: Path, lines: int = 80) -> list[str]:
             handle.seek(0, os.SEEK_END)
             end = handle.tell()
             block_size = 4096
-            data = b""
-            while end > 0 and data.count(b"\n") <= lines:
+            blocks: list[bytes] = []
+            newline_count = 0
+            while end > 0 and newline_count <= lines:
                 read_size = min(block_size, end)
                 end -= read_size
                 handle.seek(end)
-                data = handle.read(read_size) + data
+                block = handle.read(read_size)
+                newline_count += block.count(b"\n")
+                blocks.append(block)
+            blocks.reverse()
+            data = b"".join(blocks)
         return data.decode("utf-8", errors="replace").splitlines()[-lines:]
     except FileNotFoundError:
         raise SystemExit(f"log file does not exist yet: {path}")
@@ -1623,6 +1637,14 @@ def command_uninstall(paths: Paths, purge: bool, assume_yes: bool) -> int:
             print_warning(f"could not remove {paths.service_path}: {exc}")
     if systemd_available():
         systemctl("daemon-reload")
+
+    logrotate_conf = Path("/etc/logrotate.d/xpsiphon")
+    if logrotate_conf.exists():
+        try:
+            logrotate_conf.unlink()
+            print(f"removed {logrotate_conf}")
+        except OSError as exc:
+            print_warning(f"could not remove {logrotate_conf}: {exc}")
 
     for command_file in uninstall_command_paths(paths):
         try:

@@ -404,11 +404,32 @@ post_install_checks() {
   fi
 }
 
+install_logrotate() {
+  local logrotate_dir="/etc/logrotate.d"
+  if [[ ! -d "${logrotate_dir}" ]]; then
+    return
+  fi
+  log "Configuring log rotation in ${logrotate_dir}/xpsiphon"
+  cat > "${logrotate_dir}/xpsiphon" <<EOF
+${LOG_DIR}/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+  chmod 0644 "${logrotate_dir}/xpsiphon"
+}
+
 check_architecture
 install_packages
 install_manager
 install_psiphon_binary
 create_dirs
+install_logrotate
 generate_configs
 post_install_checks
 enable_service_if_requested

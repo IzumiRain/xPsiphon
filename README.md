@@ -8,10 +8,10 @@
 
 <br>
 
-[![Version](https://img.shields.io/badge/version-2.0.0-2ea043?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.1.0-2ea043?style=flat-square)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Ubuntu%20%2F%20Linux-e95420?style=flat-square)](#-step-1--get-a-server)
-[![Dependencies](https://img.shields.io/badge/python-3%20(no%20pip%20deps)-ffd343?style=flat-square)](#)
+[![Dependencies](https://img.shields.io/badge/python-3.8%2B%20(no%20pip%20deps)-ffd343?style=flat-square)](#)
 [![Locations](https://img.shields.io/badge/locations-AUTO%20%2B%2028%20countries-8957e5?style=flat-square)](#-locations--ports)
 
 </div>
@@ -47,11 +47,18 @@ can install it. Every step below is written for a first-timer.
 - [Ping & speed tests](#-ping--speed-tests)
 - [Start on boot (autostart)](#-start-on-boot-autostart)
 
+**Integrations**
+- [HTTP API](#-http-api)
+
 **Maintenance**
 - [Update](#%EF%B8%8F-update)
 - [Uninstall](#%EF%B8%8F-uninstall)
 - [Paths](#%EF%B8%8F-paths)
 - [Troubleshooting](#-troubleshooting)
+
+**Security**
+- [Security model](#-security-model)
+- [Reporting a vulnerability](#-reporting-a-vulnerability)
 
 **About**
 - [Features](#-features)
@@ -63,10 +70,27 @@ can install it. Every step below is written for a first-timer.
 
 You need a small Linux server (a "VPS"). Almost any cheap one works.
 
-- **Operating system:** Ubuntu 22 or 24 (recommended). Any recent Linux with
-  `systemd` is fine.
+- **Operating system:** any recent Linux with `systemd`. Ubuntu 22/24 and Debian
+  are the most tested; the installer also detects and uses the native package
+  manager on Fedora, RHEL 8+, AlmaLinux, Rocky Linux, CentOS 7, openSUSE, Arch
+  Linux, Manjaro, and Alpine. **x86_64 only** — the Psiphon core binaries are
+  built for x86_64 upstream.
+- **Python:** 3.8 or newer. The installer checks the real version, and on
+  distributions that still ship an older `python3` (RHEL/AlmaLinux 8, openSUSE
+  Leap 15, CentOS 7) it installs a newer one (`python39` / `python311`) and
+  exposes it as `python3`.
 - **Size:** the smallest plan is enough (1 CPU / 512 MB RAM works).
 - **Access:** you log in as `root` (or a user with `sudo`).
+
+> **Alpine note:** the installer is a bash script and Alpine ships `ash` with no
+> bash, so bash must exist before the one-liner can run:
+>
+> ```bash
+> apk add --no-cache bash curl
+> ```
+>
+> after that, the standard one-liner works (the installer also installs `procps`
+> so the process table is complete).
 
 ```bash
 ssh root@YOUR_SERVER_IP
@@ -145,6 +169,7 @@ You'll get a panel where you can, with a single keypress:
 - ⏯️ start all / stop all
 - 📜 tail a location's logs
 - 🔁 toggle autostart
+- 🔌 manage the HTTP API server (status / start / stop)
 - 🔧 change a location's SOCKS/HTTP port
 - 🧱 run the firewall / open-port check
 - 📶 run ping / speed tests
@@ -178,6 +203,10 @@ You'll get a panel where you can, with a single keypress:
 | `xp doctor` | Check prerequisites and install health |
 | `sudo xp autostart on` / `off` | Enable / disable start-on-boot |
 | `xp autostart status` | Show autostart status |
+| `sudo xp api start` | Install and start the HTTP API service |
+| `xp api status` | Show API state, URL, and a test command |
+| `xp api serve` | Run the API in the foreground (no systemd) |
+| `sudo xp api stop` | Stop and remove the API service |
 | `sudo xp update` | Update in place (keeps configs & running tunnels) |
 | `sudo xp uninstall` | Remove xPsiphon (keeps configs & binary) |
 | `sudo xp uninstall --purge` | Remove **everything** |
@@ -310,6 +339,105 @@ xp autostart status        # check
 systemctl status xpsiphon.service
 ```
 
+## 🔌 HTTP API
+
+Everything the panel does is also available over a small JSON HTTP API, so you
+can drive xPsiphon from a script, a dashboard, or another app. It uses only the
+Python standard library — no extra dependencies.
+
+### Start it
+
+```bash
+sudo xp api start          # install + start as a systemd service (recommended)
+xp api status              # show state, URL, and the test command
+sudo xp api restart        # restart the service
+sudo xp api stop           # stop and remove the service
+xp api serve               # run in the foreground (Ctrl-C to stop, no systemd)
+```
+
+By default the API listens on **`127.0.0.1:8900`** — loopback only, so it is not
+reachable from the internet. Change that with `--host` / `--port`:
+
+```bash
+sudo xp api start --host 127.0.0.1 --port 9000
+```
+
+> ⚠️ Binding to a public address (`--host 0.0.0.0`) exposes the API to the
+> network. Only do this together with a firewall rule limited to trusted IPs,
+> and treat the token as a password.
+
+### Authentication
+
+Every request needs the token. It is generated on first use and stored in
+`/etc/psiphon/api-token` with `0600` permissions. Send it as a header — there
+is deliberately **no query-parameter form**, because a token in the URL is
+world-readable in `/proc/<pid>/cmdline` and persists in shell history:
+
+```bash
+TOKEN=$(sudo cat /etc/psiphon/api-token)
+
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8900/api/status
+curl -s -H "X-Api-Token: $TOKEN"          http://127.0.0.1:8900/api/status
+```
+
+Requests without a valid token get `401`, and repeated failures from the same
+address are throttled with `429`. Set `XPSIPHON_API_TOKEN` in the
+environment to override the token file (useful for rotation without touching
+disk) — the environment value always wins.
+
+### Endpoints
+
+| Method | Endpoint | What it does |
+| --- | --- | --- |
+| `GET` | `/` | List every endpoint |
+| `GET` | `/api/version` | Version and update source |
+| `GET` | `/api/status` | Full server + per-location status |
+| `GET` | `/api/locations` | Configured locations, ports, config paths |
+| `GET` | `/api/logs/{LOC}?lines=100` | Tail one location's log (`lines` max 2000) |
+| `GET` | `/api/autostart` | autostart state |
+| `GET` | `/api/doctor` | Run the doctor checks |
+| `POST` | `/api/start/{LOC\|all}` | Start locations |
+| `POST` | `/api/stop/{LOC\|all}` | Stop locations |
+| `POST` | `/api/restart/{LOC\|all}` | Restart locations |
+| `POST` | `/api/test/{LOC\|all}?timeout=20&no_speed=1` | Latency / speed test through SOCKS |
+| `POST` | `/api/autostart/{on\|off\|toggle}` | Change autostart |
+| `POST` | `/api/port/{LOC}` | Change ports: `{"socks": 1201, "http": 8201}` |
+
+`{LOC}` is a location code (`AUTO`, `US`, `DE`, …). Endpoints that change the
+system (`start`, `stop`, `restart`, `autostart`, `port`) need the service to run
+as root and return `403` otherwise — when you install it with `sudo xp api
+start` that is already the case.
+
+### Example
+
+```bash
+TOKEN=$(sudo cat /etc/psiphon/api-token)
+BASE=http://127.0.0.1:8900
+
+# what is running right now?
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/status" | python3 -m json.tool
+
+# start every location
+curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/api/start/all"
+
+# move US to new ports
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"socks":1201,"http":8201}' \
+  "$BASE/api/port/US"
+
+# last 50 log lines for AUTO
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/logs/AUTO?lines=50"
+```
+
+Useful environment overrides for the API:
+
+```bash
+XPSIPHON_API_HOST=127.0.0.1        # bind address
+XPSIPHON_API_PORT=8900             # port
+XPSIPHON_API_TOKEN_FILE=/etc/psiphon/api-token
+XPSIPHON_API_TOKEN=...             # token override (wins over the file)
+```
+
 ## ⬆️ Update
 
 Update an existing install to the latest version:
@@ -397,6 +525,8 @@ Data roots:     /tmp/psiphon
 Logs:           /var/log/xpsiphon
 PID files:      /run/xpsiphon
 Systemd unit:   /etc/systemd/system/xpsiphon.service
+API unit:       /etc/systemd/system/xpsiphon-api.service
+API token:      /etc/psiphon/api-token
 ```
 
 Runtime overrides (environment variables):
@@ -408,7 +538,24 @@ XPSIPHON_DATA_DIR=/path/to/data
 XPSIPHON_LOG_DIR=/path/to/logs
 XPSIPHON_RUN_DIR=/path/to/run
 XPSIPHON_SERVICE_PATH=/etc/systemd/system/xpsiphon.service
+XPSIPHON_API_SERVICE_PATH=/etc/systemd/system/xpsiphon-api.service
+XPSIPHON_API_TOKEN_FILE=/etc/psiphon/api-token
 ```
+
+Optional Go runtime tuning for the tunnel processes (**off by default**):
+
+```bash
+XPSIPHON_GOGC=50                 # GC target percentage (default: Go's own value)
+XPSIPHON_GOMEMLIMIT=45MiB        # soft memory limit per tunnel process
+```
+
+These are opt-in on purpose. The Go runtime defaults are a safe baseline;
+lowering `GOGC` or setting a tight `GOMEMLIMIT` trades **more CPU** for a smaller
+resident set, which can hurt a small or single-core server. Set `XPSIPHON_*` in
+the environment before starting, or add them to the systemd unit, then
+`sudo xp restart all`. If set, they are also written into the autostart unit so
+reboots behave the same as manual starts. An explicit `XPSIPHON_*` value always
+wins over an inherited `GOGC`/`GOMEMLIMIT`.
 
 Installer overrides:
 
@@ -418,6 +565,49 @@ XPSIPHON_SHORT_PATH=/usr/local/bin/xp
 XPSIPHON_GITHUB_REPO=IzumiRain/xPsiphon
 XPSIPHON_GITHUB_REF=main
 ```
+
+## 🔐 Security model
+
+xPsiphon runs **as root** (starting and stopping tunnels requires it), so the
+security design is built around protecting that surface. The short version —
+full details in [SECURITY.md](SECURITY.md):
+
+- **The HTTP API is the only network-facing surface**, and it listens on
+  `127.0.0.1` by default. Every request needs the token (headers only — the
+  URL query form was deliberately removed because tokens in URLs are readable
+  via `/proc/<pid>/cmdline`); repeated failures from one address are throttled
+  with `429`.
+- **The API token is a root-equivalent secret.** It is generated with 192 bits
+  of entropy, stored `0600`, and comparing it is constant-time. Treat it like
+  a password; rotate it by deleting the token file or setting
+  `XPSIPHON_API_TOKEN`.
+- **systemd sandboxing** is applied to both units (`ProtectSystem=strict`,
+  `NoNewPrivileges`, `MemoryDenyWriteExecute`, bounded `ReadWritePaths`), so a
+  bug in the manager or the tunnel does not automatically mean the whole
+  filesystem is writable. Tunnels still connect normally under the sandbox.
+- **Runtime directories are validated** — the manager refuses to use a data
+  directory that someone else pre-created in `/tmp` (a known local-attack
+  pattern against root services).
+- **Downloads are sanity-checked** before being executed as root (size +
+  ELF/x86-64 header). The bootstrap still fetches code over TLS from GitHub;
+  pin `XPSIPHON_GITHUB_REF` to a tag if you want a frozen supply chain.
+
+> 🔎 Found a security bug? See [Reporting a vulnerability](#-reporting-a-vulnerability)
+> — please do not open a public issue.
+
+## 🚨 Reporting a vulnerability
+
+Please report security issues **privately**, via GitHub's
+[private vulnerability reporting](https://github.com/IzumiRain/xPsiphon/security/advisories/new)
+on this repository.
+
+Please include: the affected version (`xp version`), the distribution, what
+you did, what you expected, and — if possible — a minimal reproduction. You
+will get an acknowledgement within a few days, and credit in the changelog
+unless you prefer to stay anonymous.
+
+Please **do not** open a public issue for anything you believe is
+exploitable, and do not test against servers you do not own.
 
 ## 🩹 Troubleshooting
 
@@ -462,14 +652,32 @@ sudo xp stop all
 ```bash
 xp doctor
 xp status
-xp locations
+  xp locations
+  ```
+
+</details>
+
+<details>
+<summary>API returns <code>401</code> or <code>403</code></summary>
+
+`401` means the token is missing or wrong — send it as shown in
+[HTTP API](#-http-api). `403` means the endpoint needs root: install the API as
+a service with `sudo xp api start`, or run `sudo xp api serve`.
+
+To check it is up, and to read the token:
+
+```bash
+xp api status
+sudo cat /etc/psiphon/api-token
 ```
 
 </details>
 
+
 ## ✨ Features
 
 - One-line install on a fresh Ubuntu server
+- Multi-distribution installer (apt, dnf, yum, zypper, pacman, apk)
 - Interactive terminal panel
 - Short command alias: `xp`
 - `AUTO` location on SOCKS `1080` / HTTP `8080`
@@ -483,6 +691,7 @@ xp locations
 - Safe, non-disruptive in-place updates
 - Clean uninstall (with optional purge)
 - Optional `systemd` autostart
+- **JSON HTTP API** with token auth, for programmatic control
 - **No Python package dependencies**
 
 ## 🙌 Credits

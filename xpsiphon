@@ -13,6 +13,7 @@ import getpass
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -21,12 +22,15 @@ import sys
 import tempfile
 import textwrap
 import time
+import threading
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import parse_qs, urlparse
 
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 APP_NAME = "xpsiphon"
 SHORT_NAME = "xp"
 SERVICE_NAME = "xpsiphon.service"
@@ -43,6 +47,11 @@ INSTALLER_URL = f"{RAW_BASE}/install.sh"
 ONE_LINE_INSTALL = f"bash <(curl -fsSL {INSTALLER_URL})"
 DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
 DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=1048576"
+API_SERVICE_NAME = "xpsiphon-api.service"
+DEFAULT_API_HOST = "127.0.0.1"
+DEFAULT_API_PORT = 8900
+DEFAULT_API_TOKEN_FILE = "/etc/psiphon/api-token"
+DEFAULT_API_SERVICE_PATH = f"/etc/systemd/system/{API_SERVICE_NAME}"
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,8 @@ class Paths:
     log_dir: Path
     run_dir: Path
     service_path: Path
+    api_token_file: Path
+    api_service_path: Path
     command_path: str
 
 
@@ -79,6 +90,30 @@ def env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
+def go_runtime_env() -> dict[str, str]:
+    """Optional Go runtime tuning for the tunnel processes.
+
+    Off by default: the Go runtime's own defaults are a safe baseline, and
+    forcing an aggressive GC or a hard memory limit can raise CPU use on small
+    servers. Operators who want to trade CPU for a smaller resident set can
+    opt in per install:
+
+        XPSIPHON_GOGC=50
+        XPSIPHON_GOMEMLIMIT=45MiB
+
+    An explicit XPSIPHON_* value wins over an inherited GOGC/GOMEMLIMIT, so the
+    manager's own setting is always the one that takes effect.
+    """
+    env: dict[str, str] = {}
+    gogc = os.environ.get("XPSIPHON_GOGC", "").strip()
+    if gogc:
+        env["GOGC"] = gogc
+    gomemlimit = os.environ.get("XPSIPHON_GOMEMLIMIT", "").strip()
+    if gomemlimit:
+        env["GOMEMLIMIT"] = gomemlimit
+    return env
+
+
 def build_paths() -> Paths:
     command_path = os.environ.get("XPSIPHON_COMMAND", shutil.which(APP_NAME) or "/usr/local/bin/xpsiphon")
     return Paths(
@@ -88,6 +123,8 @@ def build_paths() -> Paths:
         log_dir=env_path("XPSIPHON_LOG_DIR", DEFAULT_LOG_DIR),
         run_dir=env_path("XPSIPHON_RUN_DIR", DEFAULT_RUN_DIR),
         service_path=env_path("XPSIPHON_SERVICE_PATH", DEFAULT_SERVICE_PATH),
+        api_token_file=env_path("XPSIPHON_API_TOKEN_FILE", DEFAULT_API_TOKEN_FILE),
+        api_service_path=env_path("XPSIPHON_API_SERVICE_PATH", DEFAULT_API_SERVICE_PATH),
         command_path=command_path,
     )
 
@@ -140,8 +177,30 @@ def require_root(action: str) -> None:
 
 
 def ensure_dirs(paths: Paths) -> None:
+    """Create runtime dirs, refusing directories we do not fully own.
+
+    The default data dir lives under /tmp, which is world-writable: a local
+    user can pre-create it (or plant symlinks inside it) so that root-run
+    tunnels write into attacker-chosen locations. An existing directory must
+    therefore be owned by the current user and not group/world-writable.
+    """
     for directory in (paths.data_dir, paths.log_dir, paths.run_dir):
+        if directory.exists():
+            info = directory.stat()
+            foreign = hasattr(os, "geteuid") and info.st_uid != os.geteuid()
+            if foreign or info.st_mode & 0o022:
+                raise SystemExit(
+                    f"refusing to use {directory}: it is owned by uid "
+                    f"{info.st_uid} with mode {info.st_mode & 0o777:o}, not by "
+                    f"the current user with a private mode. This directory "
+                    f"receives root-owned tunnel state, so a pre-planted or "
+                    f"group-writable copy is a local-attack pattern. Remove it "
+                    f"(sudo rm -rf {directory}) and re-run."
+                )
         directory.mkdir(parents=True, exist_ok=True)
+        if directory == paths.data_dir:
+            # Tunnel datastore: keep it private to root.
+            directory.chmod(0o700)
 
 
 def read_json_config(path: Path) -> dict:
@@ -294,6 +353,109 @@ def running_pids(paths: Paths, location: Location) -> list[int]:
     return pids
 
 
+def proc_cpu_ticks() -> int:
+    """Clock ticks per second, used to convert /proc stat times to seconds."""
+    try:
+        ticks = os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError, AttributeError):
+        return 100
+    return ticks if isinstance(ticks, int) and ticks > 0 else 100
+
+
+def proc_uptime_seconds() -> float | None:
+    try:
+        return float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_stat_fields(pid: int) -> list[str]:
+    """/proc/<pid>/stat fields after the (possibly space-containing) comm."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    # comm is wrapped in parentheses and may itself contain spaces or parens.
+    close = raw.rfind(")")
+    if close == -1:
+        return []
+    return raw[close + 1:].split()
+
+
+def proc_fallback_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
+    """Build process rows from /proc when `ps -o` is unavailable or unusable.
+
+    Minimal containers and BusyBox ship a `ps` that does not support the
+    `-o pid=,pcpu=,...` format, so fall back to /proc directly. CPU percent,
+    RSS and elapsed time are derived the same way `ps` derives them, so the
+    status table stays populated instead of showing blank columns.
+    """
+    uptime = proc_uptime_seconds()
+    ticks = proc_cpu_ticks()
+    mem_total_kb = read_meminfo().get("MemTotal", 0)
+
+    rows: dict[int, ProcessInfo] = {}
+    for pid in pids:
+        # A pid can disappear between discovery and this read; skip it rather
+        # than reporting a phantom process with empty metrics.
+        if not Path(f"/proc/{pid}").exists():
+            continue
+
+        command = read_proc_cmdline(pid)
+
+        rss_kb = "-"
+        try:
+            status_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            status_text = ""
+        for line in status_text.splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    rss_kb = parts[1]
+                break
+
+        cpu = "-"
+        elapsed = "-"
+        fields = proc_stat_fields(pid)
+        # fields[0] is state (stat field 3), so utime/stime/starttime land at
+        # indices 11/12/19 (stat fields 14/15/22).
+        if len(fields) >= 20:
+            try:
+                utime = int(fields[11])
+                stime = int(fields[12])
+                starttime = int(fields[19])
+            except ValueError:
+                pass
+            else:
+                if uptime is not None and ticks > 0:
+                    elapsed_seconds = uptime - (starttime / ticks)
+                    if elapsed_seconds > 0:
+                        cpu = f"{(utime + stime) / ticks / elapsed_seconds * 100:.1f}"
+                        total_seconds = int(elapsed_seconds)
+                        days, rem = divmod(total_seconds, 86400)
+                        hours, rem = divmod(rem, 3600)
+                        minutes, seconds = divmod(rem, 60)
+                        if days:
+                            elapsed = f"{days}-{hours:02d}:{minutes:02d}:{seconds:02d}"
+                        else:
+                            elapsed = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+        mem = "-"
+        if mem_total_kb > 0 and rss_kb.isdigit():
+            mem = f"{int(rss_kb) / mem_total_kb * 100:.1f}"
+
+        rows[pid] = ProcessInfo(
+            pid=pid,
+            cpu=cpu,
+            mem=mem,
+            rss=rss_kb,
+            elapsed=elapsed,
+            command=command,
+        )
+    return rows
+
+
 def ps_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
     if not pids:
         return {}
@@ -301,9 +463,9 @@ def ps_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
     try:
         result = subprocess.run(cmd, check=False, text=True, capture_output=True)
     except FileNotFoundError:
-        return {}
+        return proc_fallback_rows(pids)
     if result.returncode not in (0, 1):
-        return {}
+        return proc_fallback_rows(pids)
 
     rows: dict[int, ProcessInfo] = {}
     for line in result.stdout.splitlines():
@@ -320,6 +482,10 @@ def ps_rows(pids: Sequence[int]) -> dict[int, ProcessInfo]:
             elapsed=parts[4],
             command=command,
         )
+    # A BusyBox `ps` ignores -o and prints a different format; if nothing
+    # parsed, use /proc rather than reporting every process as missing.
+    if not rows:
+        return proc_fallback_rows(pids)
     return rows
 
 
@@ -742,6 +908,55 @@ def curl_probe(proxy_port: int, url: str, timeout: int) -> tuple[bool, str, str,
     return ok, status, latency_ms, speed_value
 
 
+def test_location_once(
+    location: Location,
+    test_url: str,
+    speed_url: str,
+    timeout: int,
+    include_speed: bool,
+) -> dict:
+    """Run one ping/speed test and return a JSON-friendly result dict."""
+    result: dict = {
+        "code": location.code,
+        "socks": location.socks_port,
+        "ok": False,
+        "state": "invalid_port",
+        "http_code": None,
+        "latency_ms": None,
+        "speed_bps": None,
+        "speed_error": None,
+        "error": "invalid SOCKS port",
+    }
+    if not location.socks_port.isdigit():
+        return result
+
+    port = int(location.socks_port)
+    result["socks"] = str(port)
+    if not can_connect("127.0.0.1", port):
+        result["state"] = "not_listening"
+        result["error"] = "not listening"
+        return result
+
+    ok, status, latency_ms, _ = curl_probe(port, test_url, timeout)
+    result["http_code"] = status
+    result["latency_ms"] = int(latency_ms) if latency_ms.isdigit() else None
+    if not ok:
+        result["state"] = "test_failed"
+        result["error"] = f"test failed (HTTP {status})" if status not in {"", "-"} else "test failed"
+        return result
+
+    result["state"] = "ok"
+    result["ok"] = True
+    result["error"] = None
+    if include_speed:
+        speed_ok, speed_status, _, speed_value = curl_probe(port, speed_url, timeout)
+        if speed_ok:
+            result["speed_bps"] = speed_value
+        else:
+            result["speed_error"] = speed_status
+    return result
+
+
 def command_test(
     paths: Paths,
     target: str,
@@ -768,33 +983,31 @@ def command_test(
     rows: list[list[str]] = []
     failures = 0
     for location in locations:
-        if not location.socks_port.isdigit():
-            rows.append([location.code, "-", "-", "-", "-", Color.red("invalid SOCKS port")])
+        result = test_location_once(location, test_url, speed_url, timeout, include_speed)
+        code, socks = result["code"], result["socks"]
+        if result["state"] == "invalid_port":
+            rows.append([code, "-", "-", "-", "-", Color.red("invalid SOCKS port")])
             failures += 1
             continue
-
-        port = int(location.socks_port)
-        if not can_connect("127.0.0.1", port):
-            rows.append([location.code, str(port), "-", "-", "-", Color.yellow("not listening")])
+        if result["state"] == "not_listening":
+            rows.append([code, socks, "-", "-", "-", Color.yellow("not listening")])
             failures += 1
             continue
-
-        ok, status, latency_ms, _ = curl_probe(port, test_url, timeout)
-        if not ok:
-            rows.append([location.code, str(port), status, "-", "-", Color.red(latency_ms)])
+        if result["state"] == "test_failed":
+            latency_text = str(result["latency_ms"]) if result["latency_ms"] is not None else "-"
+            rows.append([code, socks, result["http_code"] or "-", "-", "-", Color.red(latency_text)])
             failures += 1
             continue
 
         speed_text = "-"
         if include_speed:
-            speed_ok, speed_status, _, speed_value = curl_probe(port, speed_url, timeout)
-            if speed_ok:
-                speed_text = speed_human(speed_value)
-            else:
-                speed_text = Color.red(speed_status)
+            if result["speed_error"]:
+                speed_text = Color.red(result["speed_error"])
                 failures += 1
+            elif result["speed_bps"] is not None:
+                speed_text = speed_human(result["speed_bps"])
 
-        rows.append([location.code, str(port), status, f"{latency_ms} ms", speed_text, Color.green("ok")])
+        rows.append([code, socks, result["http_code"] or "-", f"{result['latency_ms']} ms", speed_text, Color.green("ok")])
 
     print(table(["Loc", "SOCKS", "Code", "Ping", "Speed", "Result"], rows))
     print()
@@ -802,12 +1015,11 @@ def command_test(
     return 0 if failures == 0 else 1
 
 
-def start_location(paths: Paths, location: Location) -> bool:
+def start_location(paths: Paths, location: Location) -> tuple[bool, str]:
     ensure_dirs(paths)
     pids = running_pids(paths, location)
     if pids:
-        print(f"{location.code}: already running (PID {', '.join(str(pid) for pid in pids)})")
-        return False
+        return False, f"{location.code}: already running (PID {', '.join(str(pid) for pid in pids)})"
 
     if not paths.psiphon_bin.exists():
         raise SystemExit(
@@ -833,6 +1045,8 @@ def start_location(paths: Paths, location: Location) -> bool:
         "-dataRootDirectory",
         str(root),
     ]
+    env = os.environ.copy()
+    env.update(go_runtime_env())
     with log_path.open("ab", buffering=0) as log_handle:
         process = subprocess.Popen(
             args,
@@ -840,11 +1054,11 @@ def start_location(paths: Paths, location: Location) -> bool:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
 
     pid_file(paths, location).write_text(f"{process.pid}\n", encoding="utf-8")
-    print(f"{location.code}: started PID {process.pid} | log {log_path}")
-    return True
+    return True, f"{location.code}: started PID {process.pid} | log {log_path}"
 
 
 def stop_pid(pid: int, timeout: float = 8.0) -> bool:
@@ -870,12 +1084,11 @@ def stop_pid(pid: int, timeout: float = 8.0) -> bool:
     return not process_alive(pid)
 
 
-def stop_location(paths: Paths, location: Location) -> bool:
+def stop_location(paths: Paths, location: Location) -> tuple[bool, str]:
     pids = running_pids(paths, location)
     if not pids:
         pid_file(paths, location).unlink(missing_ok=True)
-        print(f"{location.code}: already stopped")
-        return False
+        return False, f"{location.code}: already stopped"
 
     stopped: list[int] = []
     for pid in pids:
@@ -883,15 +1096,14 @@ def stop_location(paths: Paths, location: Location) -> bool:
             stopped.append(pid)
     pid_file(paths, location).unlink(missing_ok=True)
     if stopped:
-        print(f"{location.code}: stopped PID {', '.join(str(pid) for pid in stopped)}")
-        return True
-    print(f"{location.code}: no processes stopped")
-    return False
+        return True, f"{location.code}: stopped PID {', '.join(str(pid) for pid in stopped)}"
+    return False, f"{location.code}: no processes stopped"
 
 
-def restart_location(paths: Paths, location: Location) -> None:
-    stop_location(paths, location)
-    start_location(paths, location)
+def restart_location(paths: Paths, location: Location) -> list[str]:
+    _, stop_message = stop_location(paths, location)
+    _, start_message = start_location(paths, location)
+    return [stop_message, start_message]
 
 
 def command_start(paths: Paths, target: str) -> int:
@@ -902,7 +1114,9 @@ def command_start(paths: Paths, target: str) -> int:
         return 1
     changed = False
     for location in locations:
-        changed = start_location(paths, location) or changed
+        started, message = start_location(paths, location)
+        print(message)
+        changed = started or changed
     return 0 if changed or target.lower() != "all" else 0
 
 
@@ -913,7 +1127,8 @@ def command_stop(paths: Paths, target: str) -> int:
         print_warning(f"no configs found in {paths.conf_dir}")
         return 1
     for location in locations:
-        stop_location(paths, location)
+        _, message = stop_location(paths, location)
+        print(message)
     return 0
 
 
@@ -924,7 +1139,8 @@ def command_restart(paths: Paths, target: str) -> int:
         print_warning(f"no configs found in {paths.conf_dir}")
         return 1
     for location in locations:
-        restart_location(paths, location)
+        for message in restart_location(paths, location):
+            print(message)
     return 0
 
 
@@ -980,6 +1196,30 @@ def command_logs(paths: Paths, target: str, follow: bool, lines: int) -> int:
     return 0
 
 
+def sandbox_directives(read_write: list[Path]) -> list[str]:
+    """systemd sandboxing for root-run xPsiphon units (defense in depth).
+
+    The tunnels only need their data/log/run directories writable plus
+    network access; everything else stays read-only. PrivateTmp must stay
+    off so a systemd-started tunnel shares the same /tmp/psiphon state as
+    CLI-started ones.
+    """
+    rw = " ".join(str(path) for path in sorted(set(str(p) for p in read_write)))
+    return [
+        "NoNewPrivileges=true",
+        "ProtectSystem=strict",
+        "ProtectHome=true",
+        "PrivateTmp=false",
+        f"ReadWritePaths={rw}",
+        "RestrictSUIDSGID=true",
+        "ProtectKernelTunables=true",
+        "ProtectControlGroups=true",
+        "ProtectKernelModules=true",
+        "LockPersonality=true",
+        "MemoryDenyWriteExecute=true",
+    ]
+
+
 def service_unit(paths: Paths) -> str:
     environment_lines = [
         f'Environment="XPSIPHON_BIN={paths.psiphon_bin}"',
@@ -988,6 +1228,13 @@ def service_unit(paths: Paths) -> str:
         f'Environment="XPSIPHON_LOG_DIR={paths.log_dir}"',
         f'Environment="XPSIPHON_RUN_DIR={paths.run_dir}"',
     ]
+    # Forward the opt-in Go tuning so autostarted tunnels behave like manually
+    # started ones. Emit XPSIPHON_* so the manager applies its normal
+    # precedence (explicit override wins) rather than relying on inheritance.
+    for source in ("XPSIPHON_GOGC", "XPSIPHON_GOMEMLIMIT"):
+        value = os.environ.get(source, "").strip()
+        if value:
+            environment_lines.append(f'Environment="{source}={value}"')
     return "\n".join(
         [
             "[Unit]",
@@ -999,6 +1246,7 @@ def service_unit(paths: Paths) -> str:
             "Type=oneshot",
             "RemainAfterExit=yes",
             *environment_lines,
+            *sandbox_directives([paths.data_dir, paths.log_dir, paths.run_dir]),
             f"ExecStart={paths.command_path} start all",
             f"ExecStop={paths.command_path} stop all",
             "TimeoutStartSec=120",
@@ -1076,11 +1324,10 @@ def command_autostart(paths: Paths, action: str) -> int:
     raise SystemExit(f"unknown autostart action: {action}")
 
 
-def doctor(paths: Paths) -> int:
-    failures = 0
-    print(Color.bold(Color.cyan(f"xPsiphon Doctor  v{VERSION}")))
+def doctor_checks(paths: Paths) -> list[tuple[str, bool, str]]:
+    """Doctor checks as (label, ok, detail) rows, shared by CLI and API."""
     checks: list[tuple[str, bool, str]] = []
-    checks.append(("Python", sys.version_info >= (3, 10), sys.version.split()[0]))
+    checks.append(("Python", sys.version_info >= (3, 8), sys.version.split()[0]))
     checks.append(("Psiphon binary exists", paths.psiphon_bin.exists(), str(paths.psiphon_bin)))
     checks.append(("Psiphon binary executable", os.access(paths.psiphon_bin, os.X_OK), str(paths.psiphon_bin)))
     checks.append(("Config directory exists", paths.conf_dir.is_dir(), str(paths.conf_dir)))
@@ -1089,6 +1336,14 @@ def doctor(paths: Paths) -> int:
     checks.append(("curl available", shutil.which("curl") is not None, shutil.which("curl") or "missing"))
     checks.append(("systemctl available", shutil.which("systemctl") is not None, shutil.which("systemctl") or "missing"))
     checks.append(("systemd running", systemd_available(), "/run/systemd/system"))
+    return checks
+
+
+def doctor(paths: Paths) -> int:
+    failures = 0
+    print(Color.bold(Color.cyan(f"xPsiphon Doctor  v{VERSION}")))
+    checks = doctor_checks(paths)
+    locations = discover_locations(paths)
 
     for label, ok, detail in checks:
         state = Color.green("OK") if ok else Color.red("FAIL")
@@ -1169,6 +1424,7 @@ def interactive(paths: Paths) -> int:
         print(f"{Color.cyan('8)')} Tail location log")
         print(f"{Color.cyan('9)')} Toggle autostart")
         print(f"{Color.cyan('p)')} Change location port")
+        print(f"{Color.cyan('A)')} API server (status / start / stop)")
         print(f"{Color.cyan('f)')} Firewall / open ports check")
         print(f"{Color.cyan('t)')} Ping / speed test")
         print(f"{Color.cyan('d)')} Doctor")
@@ -1219,6 +1475,19 @@ def interactive(paths: Paths) -> int:
             elif choice == "p":
                 require_root("changing location ports")
                 prompt_port_change(paths)
+                pause()
+            elif choice == "a":
+                clear_screen()
+                command_api_status(paths)
+                print()
+                if paths.api_service_path.exists():
+                    answer = input("Disable and remove the API service? [y/N]: ").strip().lower()
+                    if answer in {"y", "yes"}:
+                        command_api_stop(paths)
+                else:
+                    answer = input("Install and start the API service (systemd)? [y/N]: ").strip().lower()
+                    if answer in {"y", "yes"}:
+                        command_api_start(paths, DEFAULT_API_HOST, DEFAULT_API_PORT)
                 pause()
             elif choice == "f":
                 clear_screen()
@@ -1273,6 +1542,8 @@ def build_parser() -> argparse.ArgumentParser:
               sudo xpsiphon update
               sudo xpsiphon uninstall
               sudo xpsiphon autostart toggle
+              sudo xpsiphon api start
+              xpsiphon api status
             """
         ).strip(),
     )
@@ -1315,6 +1586,21 @@ def build_parser() -> argparse.ArgumentParser:
     port.add_argument("target", help="location code, e.g. US")
     port.add_argument("--socks", type=int, default=None, help="new SOCKS proxy port")
     port.add_argument("--http", type=int, default=None, help="new HTTP proxy port")
+
+    api = subparsers.add_parser("api", help="manage the HTTP API server")
+    api_sub = api.add_subparsers(dest="api_command")
+
+    api_serve = api_sub.add_parser("serve", help="run the API server in the foreground (Ctrl-C to stop)")
+    api_serve.add_argument("--host", default=os.environ.get("XPSIPHON_API_HOST", DEFAULT_API_HOST), help="bind address (default: loopback only)")
+    api_serve.add_argument("--port", type=int, default=int(os.environ.get("XPSIPHON_API_PORT", DEFAULT_API_PORT)), help="port to listen on")
+
+    api_start = api_sub.add_parser("start", help="install and start the API as a systemd service (root)")
+    api_start.add_argument("--host", default=os.environ.get("XPSIPHON_API_HOST", DEFAULT_API_HOST), help="bind address (default: loopback only)")
+    api_start.add_argument("--port", type=int, default=int(os.environ.get("XPSIPHON_API_PORT", DEFAULT_API_PORT)), help="port to listen on")
+
+    api_sub.add_parser("stop", help="stop and remove the API service (root)")
+    api_sub.add_parser("restart", help="restart the API service (root)")
+    api_sub.add_parser("status", help="show API service status")
 
     update = subparsers.add_parser("update", help="update xPsiphon in place without disrupting running tunnels")
     update.add_argument("--force-psiphon", action="store_true", help="also re-download the Psiphon core binary")
@@ -1389,9 +1675,60 @@ def write_location_ports(
         data["LocalSocksProxyPort"] = socks_port
     if http_port is not None:
         data["LocalHttpProxyPort"] = http_port
-    location.config_path.write_text(
-        json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8"
-    )
+    # Atomic replace so a crash or full disk cannot leave a truncated config.
+    tmp_path = location.config_path.with_name(location.config_path.name + ".tmp")
+    try:
+        tmp_path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        os.replace(tmp_path, location.config_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def port_change_result(
+    paths: Paths,
+    location: Location,
+    socks_port: int | None,
+    http_port: int | None,
+) -> tuple[bool, list[tuple[str, str]]]:
+    """Validate and apply a port change.
+
+    Returns (ok, events) where each event is (level, message) with level one of
+    "info", "warning", or "error". Shared by the CLI and the HTTP API.
+    """
+    events: list[tuple[str, str]] = []
+
+    def add(level: str, message: str) -> None:
+        events.append((level, message))
+
+    if socks_port is None and http_port is None:
+        add("error", "provide a new socks and/or http port")
+        return False, events
+
+    for label, value in (("SOCKS", socks_port), ("HTTP", http_port)):
+        if value is not None and not valid_port(value):
+            add("error", f"{label} port {value} is out of range (1-65535)")
+            return False, events
+        if value is not None and value < 1024:
+            add("warning", f"{label} port {value} is privileged (<1024); binding may need root")
+
+    problems = port_conflicts(paths, location, socks_port, http_port)
+    if problems:
+        for problem in problems:
+            add("error", problem)
+        return False, events
+
+    old_socks, old_http = location.socks_port, location.http_port
+    write_location_ports(location, socks_port, http_port)
+
+    new_socks = str(socks_port) if socks_port is not None else old_socks
+    new_http = str(http_port) if http_port is not None else old_http
+    add("info", f"{location.code}: SOCKS {old_socks} -> {new_socks} | HTTP {old_http} -> {new_http}")
+    add("info", f"Updated {location.config_path}")
+
+    if running_pids(paths, location):
+        add("warning", f"{location.code} is running; restart it to apply the new ports:")
+        add("info", f"  sudo {APP_NAME} restart {location.code}")
+    return True, events
 
 
 def apply_location_ports(
@@ -1400,35 +1737,15 @@ def apply_location_ports(
     socks_port: int | None,
     http_port: int | None,
 ) -> int:
-    if socks_port is None and http_port is None:
-        print_error("provide a new --socks and/or --http port")
-        return 1
-
-    for label, value in (("SOCKS", socks_port), ("HTTP", http_port)):
-        if value is not None and not valid_port(value):
-            print_error(f"{label} port {value} is out of range (1-65535)")
-            return 1
-        if value is not None and value < 1024:
-            print_warning(f"{label} port {value} is privileged (<1024); binding may need root")
-
-    problems = port_conflicts(paths, location, socks_port, http_port)
-    if problems:
-        for problem in problems:
-            print_error(problem)
-        return 1
-
-    old_socks, old_http = location.socks_port, location.http_port
-    write_location_ports(location, socks_port, http_port)
-
-    new_socks = str(socks_port) if socks_port is not None else old_socks
-    new_http = str(http_port) if http_port is not None else old_http
-    print(f"{location.code}: SOCKS {old_socks} -> {new_socks} | HTTP {old_http} -> {new_http}")
-    print(f"Updated {location.config_path}")
-
-    if running_pids(paths, location):
-        print_warning(f"{location.code} is running; restart it to apply the new ports:")
-        print(f"  sudo {APP_NAME} restart {location.code}")
-    return 0
+    ok, events = port_change_result(paths, location, socks_port, http_port)
+    for level, message in events:
+        if level == "error":
+            print_error(message)
+        elif level == "warning":
+            print_warning(message)
+        else:
+            print(message)
+    return 0 if ok else 1
 
 
 def command_port(paths: Paths, target: str, socks_port: int | None, http_port: int | None) -> int:
@@ -1536,6 +1853,9 @@ def uninstall_command_paths(paths: Paths) -> list[Path]:
         if found:
             candidates.append(Path(found))
         candidates.append(Path(f"/usr/local/bin/{name}"))
+        # The installer adds /usr/bin aliases so `sudo xp ...` also works on
+        # RHEL-family distros, whose sudo secure_path omits /usr/local/bin.
+        candidates.append(Path(f"/usr/bin/{name}"))
 
     seen: set[str] = set()
     unique: list[Path] = []
@@ -1555,6 +1875,7 @@ def command_uninstall(paths: Paths, purge: bool, assume_yes: bool) -> int:
     print("This will:")
     print("  - stop all running Psiphon locations")
     print(f"  - disable and remove {SERVICE_NAME}")
+    print(f"  - disable and remove {API_SERVICE_NAME} (if installed)")
     print(f"  - remove the {APP_NAME} and {SHORT_NAME} commands")
     print(f"  - remove runtime dirs: {paths.run_dir}, {paths.log_dir}, {paths.data_dir}")
     if purge:
@@ -1586,6 +1907,14 @@ def command_uninstall(paths: Paths, purge: bool, assume_yes: bool) -> int:
         except OSError as exc:
             print_warning(f"could not remove {paths.service_path}: {exc}")
     if systemd_available():
+        systemctl("disable", API_SERVICE_NAME)
+    if paths.api_service_path.exists():
+        try:
+            paths.api_service_path.unlink()
+            print(f"removed {paths.api_service_path}")
+        except OSError as exc:
+            print_warning(f"could not remove {paths.api_service_path}: {exc}")
+    if systemd_available():
         systemctl("daemon-reload")
 
     for command_file in uninstall_command_paths(paths):
@@ -1605,6 +1934,14 @@ def command_uninstall(paths: Paths, purge: bool, assume_yes: bool) -> int:
         if paths.conf_dir.exists():
             shutil.rmtree(paths.conf_dir, ignore_errors=True)
             print(f"removed {paths.conf_dir}")
+        # The API token is a credential on disk, so a purge must take it too —
+        # leaving it behind also keeps /etc/psiphon alive after the rmdir below.
+        if paths.api_token_file.exists():
+            try:
+                paths.api_token_file.unlink()
+                print(f"removed {paths.api_token_file}")
+            except OSError as exc:
+                print_warning(f"could not remove {paths.api_token_file}: {exc}")
         if paths.psiphon_bin.exists():
             try:
                 paths.psiphon_bin.unlink()
@@ -1623,6 +1960,676 @@ def command_uninstall(paths: Paths, purge: bool, assume_yes: bool) -> int:
     if not purge:
         print(f"Configs and Psiphon binary were kept in {psiphon_dir}.")
         print(f"Remove them too with: sudo rm -rf {psiphon_dir}")
+        if paths.api_token_file.exists():
+            print(f"The API token was kept: {paths.api_token_file} (delete it if no longer needed)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# HTTP API
+# ---------------------------------------------------------------------------
+
+
+def api_running_as_root() -> bool:
+    return not hasattr(os, "geteuid") or os.geteuid() == 0
+
+
+def ensure_api_token(paths: Paths, quiet: bool = False) -> str:
+    """Return the API token, creating the token file on first use.
+
+    XPSIPHON_API_TOKEN always wins over the token file, so operators can
+    rotate the token without touching disk.
+    """
+    env_token = os.environ.get("XPSIPHON_API_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
+    token = ""
+    try:
+        token = paths.api_token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if token:
+        return token
+
+    token = secrets.token_hex(24)
+    try:
+        paths.api_token_file.parent.mkdir(parents=True, exist_ok=True)
+        # Create with 0600 from the start: write_text + chmod leaves a
+        # world-readable window on multi-user hosts.
+        fd = os.open(paths.api_token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+    except OSError as exc:
+        raise SystemExit(f"cannot write API token file {paths.api_token_file}: {exc}") from exc
+    if not quiet:
+        print(f"Generated API token file: {paths.api_token_file}")
+    return token
+
+
+def api_resolve_locations(paths: Paths, target: str) -> tuple[list[Location], str | None]:
+    """Resolve a location target for the API: returns (locations, error)."""
+    locations = discover_locations(paths)
+    if target.lower() == "all":
+        return locations, None
+    code = normalize_code(target)
+    for location in locations:
+        if location.code == code:
+            return [location], None
+    available = ", ".join(location.code for location in locations) or "none"
+    return [], f"unknown location '{target}'. Available locations: {available}"
+
+
+def location_json(paths: Paths, location: Location) -> dict:
+    return {
+        "code": location.code,
+        "kind": location_kind(location),
+        "socks": int(location.socks_port) if location.socks_port.isdigit() else None,
+        "http": int(location.http_port) if location.http_port.isdigit() else None,
+        "config": str(location.config_path),
+        "log": str(log_file(paths, location)),
+    }
+
+
+API_ROOT_EXEMPT_CHECKS = {"systemctl available", "systemd running"}
+
+
+# Failed-auth throttle: the token is 192-bit random, but an operator may set a
+# weak XPSIPHON_API_TOKEN, and an externally bound API would otherwise accept
+# unbounded guessing. Per-source sliding window; successes clear the counter.
+AUTH_FAILURE_WINDOW_SECONDS = 60.0
+AUTH_FAILURE_LIMIT = 10
+_auth_failures: dict[str, list[float]] = {}
+_auth_failures_lock = threading.Lock()
+
+
+def record_auth_failure(peer: str) -> bool:
+    """Record a failed auth attempt for `peer`; True once it exceeds the limit."""
+    now = time.monotonic()
+    with _auth_failures_lock:
+        stamps = [t for t in _auth_failures.get(peer, []) if now - t < AUTH_FAILURE_WINDOW_SECONDS]
+        stamps.append(now)
+        _auth_failures[peer] = stamps
+        return len(stamps) > AUTH_FAILURE_LIMIT
+
+
+def clear_auth_failures(peer: str) -> None:
+    with _auth_failures_lock:
+        _auth_failures.pop(peer, None)
+
+
+def api_status(paths: Paths) -> dict:
+    """Full status as a JSON-friendly dict (no color codes)."""
+    locations = discover_locations(paths)
+    all_pids: list[int] = []
+    location_pids: dict[str, list[int]] = {}
+    for location in locations:
+        pids = running_pids(paths, location)
+        location_pids[location.code] = pids
+        all_pids.extend(pids)
+    proc_info = ps_rows(all_pids)
+
+    items: list[dict] = []
+    running_locations = 0
+    running_processes = 0
+    total_cpu = 0.0
+    total_mem = 0.0
+    for location in locations:
+        processes = []
+        location_pids_list = location_pids[location.code]
+        if location_pids_list:
+            running_locations += 1
+        for pid in location_pids_list:
+            info = proc_info.get(pid)
+            try:
+                cpu = float(info.cpu) if info else None
+            except ValueError:
+                cpu = None
+            try:
+                mem = float(info.mem) if info else None
+            except ValueError:
+                mem = None
+            rss_kb = int(info.rss) if info and info.rss.isdigit() else None
+            if cpu is not None:
+                total_cpu += cpu
+            if mem is not None:
+                total_mem += mem
+            running_processes += 1
+            processes.append(
+                {
+                    "pid": pid,
+                    "cpu_percent": cpu,
+                    "mem_percent": mem,
+                    "rss_kb": rss_kb,
+                    "rss_human": format_rss(info.rss) if info else None,
+                    "uptime": info.elapsed if info else None,
+                }
+            )
+        items.append(
+            {
+                **location_json(paths, location),
+                "state": "running" if location_pids_list else "stopped",
+                "processes": processes,
+            }
+        )
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "server": dict(server_status()),
+        "locations_configured": len(locations),
+        "locations_running": running_locations,
+        "processes_running": running_processes,
+        "aggregate_cpu_percent": round(total_cpu, 1),
+        "aggregate_mem_percent": round(total_mem, 1),
+        "conf_dir": str(paths.conf_dir),
+        "log_dir": str(paths.log_dir),
+        "locations": items,
+    }
+
+
+def parse_body_port(data: dict, key: str) -> tuple[int | None, str | None]:
+    value = data.get(key)
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, f"'{key}' must be a port number"
+    if isinstance(value, int):
+        return value, None
+    if isinstance(value, str) and value.isdigit():
+        return int(value), None
+    return None, f"'{key}' must be a port number"
+
+
+class ApiRequestHandler(BaseHTTPRequestHandler):
+    """Minimal JSON HTTP API over the same core functions the CLI and TUI use."""
+
+    server_version = f"xPsiphon/{VERSION}"
+    protocol_version = "HTTP/1.1"
+    paths: Paths | None = None
+    token: str = ""
+
+    # ---- plumbing ----
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        try:
+            message = fmt % args
+        except (TypeError, ValueError):
+            message = fmt
+        message = re.sub(r"([?&]token=)[^&\s\"]+", r"\1REDACTED", message)
+        sys.stderr.write(f"[api] {self.address_string()} {message}\n")
+
+    def send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def query_params(self) -> dict[str, list[str]]:
+        return parse_qs(urlparse(self.path).query)
+
+    def query_value(self, params: dict[str, list[str]], name: str, default: str) -> str:
+        values = params.get(name)
+        return values[0] if values else default
+
+    def authorized(self) -> bool:
+        expected = self.token
+        if not expected:
+            return False
+        header = self.headers.get("Authorization", "")
+        candidate = ""
+        if header.startswith("Bearer "):
+            candidate = header[len("Bearer "):].strip()
+        if not candidate:
+            candidate = self.headers.get("X-Api-Token", "").strip()
+        # Deliberately no query-parameter form: a token in the URL is
+        # world-readable via /proc/<pid>/cmdline and persists in shell
+        # history; headers keep it out of both.
+        if not candidate:
+            return False
+        return secrets.compare_digest(candidate, expected)
+
+    def read_body_json(self, limit: int = 64 * 1024) -> tuple[dict | None, str | None]:
+        """Read the request body. Returns (data, error); error "__sent__" means a response was already sent."""
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            return None, "invalid Content-Length"
+        if length > limit:
+            self.send_json(413, {"ok": False, "error": f"request body too large (limit {limit} bytes)"})
+            return None, "__sent__"
+        if length <= 0:
+            return {}, None
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return None, f"invalid JSON body: {exc}"
+        if not isinstance(data, dict):
+            return None, "JSON body must be an object"
+        return data, None
+
+    def require_paths(self) -> Paths:
+        if self.paths is None:
+            raise RuntimeError("API handler is not configured")
+        return self.paths
+
+    # ---- dispatch ----
+
+    def do_GET(self) -> None:
+        self.dispatch("GET")
+
+    def do_POST(self) -> None:
+        self.dispatch("POST")
+
+    def dispatch(self, method: str) -> None:
+        try:
+            peer = self.client_address[0]
+            if not self.authorized():
+                if record_auth_failure(peer):
+                    self.send_json(
+                        429,
+                        {"ok": False, "error": "too many failed authentication attempts; try again later"},
+                    )
+                    return
+                self.send_json(
+                    401,
+                    {"ok": False, "error": "unauthorized: send the API token as 'Authorization: Bearer <token>'"},
+                )
+                return
+            clear_auth_failures(peer)
+            parts = [part for part in urlparse(self.path).path.split("/") if part]
+            if method == "GET":
+                self.route_get(parts)
+            else:
+                self.route_post(parts)
+        except SystemExit as exc:
+            self.send_json(500, {"ok": False, "error": str(exc) or "command failed"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            self.send_json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def route_get(self, parts: list[str]) -> None:
+        paths = self.require_paths()
+        if not parts:
+            self.endpoint_index()
+        elif parts == ["api", "version"]:
+            self.send_json(200, {"ok": True, "version": VERSION, "source": f"{GITHUB_REPO}@{GITHUB_REF}"})
+        elif parts == ["api", "status"]:
+            self.send_json(200, api_status(paths))
+        elif parts == ["api", "locations"]:
+            locations = discover_locations(paths)
+            self.send_json(
+                200,
+                {"ok": True, "count": len(locations), "locations": [location_json(paths, loc) for loc in locations]},
+            )
+        elif len(parts) == 3 and parts[0] == "api" and parts[1] == "logs":
+            self.endpoint_logs(parts[2])
+        elif parts == ["api", "autostart"]:
+            enabled, state = autostart_status(paths)
+            self.send_json(200, {"ok": True, "enabled": enabled, "state": state, "service": str(paths.service_path)})
+        elif parts == ["api", "doctor"]:
+            self.endpoint_doctor()
+        else:
+            self.send_json(404, {"ok": False, "error": f"no such endpoint: GET /{'/'.join(parts)}"})
+
+    def route_post(self, parts: list[str]) -> None:
+        paths = self.require_paths()
+        if len(parts) == 3 and parts[0] == "api" and parts[1] in {"start", "stop", "restart"}:
+            self.endpoint_lifecycle(parts[1], parts[2])
+        elif len(parts) == 3 and parts[0] == "api" and parts[1] == "test":
+            self.endpoint_test(parts[2])
+        elif len(parts) == 3 and parts[0] == "api" and parts[1] == "autostart":
+            self.endpoint_autostart_action(parts[2])
+        elif len(parts) == 3 and parts[0] == "api" and parts[1] == "port":
+            self.endpoint_port(parts[2])
+        else:
+            self.send_json(404, {"ok": False, "error": f"no such endpoint: POST /{'/'.join(parts)}"})
+
+    # ---- endpoints ----
+
+    def endpoint_index(self) -> None:
+        self.send_json(
+            200,
+            {
+                "ok": True,
+                "name": "xPsiphon API",
+                "version": VERSION,
+                "auth": "Authorization: Bearer <token>",
+                "endpoints": {
+                    "GET /api/version": "show version",
+                    "GET /api/status": "full server and per-location status",
+                    "GET /api/locations": "list configured locations",
+                    "GET /api/logs/{LOC}?lines=100": "tail one location log",
+                    "GET /api/autostart": "show systemd autostart state",
+                    "GET /api/doctor": "run doctor checks",
+                    "POST /api/start/{LOC|all}": "start locations",
+                    "POST /api/stop/{LOC|all}": "stop locations",
+                    "POST /api/restart/{LOC|all}": "restart locations",
+                    "POST /api/test/{LOC|all}?timeout=20&no_speed=0": "ping/speed test through SOCKS proxies",
+                    "POST /api/autostart/{on|off|toggle}": "change systemd autostart",
+                    "POST /api/port/{LOC}": "change ports: body {\"socks\": 1201, \"http\": 8201}",
+                },
+            },
+        )
+
+    def endpoint_logs(self, code: str) -> None:
+        paths = self.require_paths()
+        locations, error = api_resolve_locations(paths, code)
+        if error:
+            self.send_json(404, {"ok": False, "error": error})
+            return
+        if len(locations) != 1:
+            self.send_json(400, {"ok": False, "error": "logs requires a single location code, not all"})
+            return
+        location = locations[0]
+        params = self.query_params()
+        try:
+            lines = int(self.query_value(params, "lines", "100"))
+        except ValueError:
+            lines = 100
+        lines = max(1, min(lines, 2000))
+        log_path = log_file(paths, location)
+        try:
+            entries = tail_file(log_path, lines=lines)
+        except SystemExit as exc:
+            self.send_json(404, {"ok": False, "error": str(exc)})
+            return
+        self.send_json(200, {"ok": True, "code": location.code, "log": str(log_path), "lines": entries})
+
+    def endpoint_doctor(self) -> None:
+        paths = self.require_paths()
+        checks = doctor_checks(paths)
+        failures = sum(1 for label, ok, _ in checks if not ok and label not in API_ROOT_EXEMPT_CHECKS)
+        self.send_json(
+            200,
+            {
+                "ok": failures == 0,
+                "checks": [{"check": label, "ok": ok, "detail": detail} for label, ok, detail in checks],
+            },
+        )
+
+    def endpoint_lifecycle(self, action: str, target: str) -> None:
+        paths = self.require_paths()
+        locations, error = api_resolve_locations(paths, target)
+        if error:
+            self.send_json(404, {"ok": False, "error": error})
+            return
+        if not locations:
+            self.send_json(200, {"ok": False, "error": f"no configs found in {paths.conf_dir}"})
+            return
+        if not api_running_as_root():
+            self.send_json(
+                403,
+                {"ok": False, "error": f"{action} requires root; run the API service as root: sudo {APP_NAME} api start"},
+            )
+            return
+        results = []
+        for location in locations:
+            if action == "restart":
+                messages = restart_location(paths, location)
+                results.append({"code": location.code, "action": "restart", "changed": True, "messages": messages})
+            elif action == "stop":
+                stopped, message = stop_location(paths, location)
+                results.append({"code": location.code, "action": "stop", "changed": stopped, "message": message})
+            else:
+                started, message = start_location(paths, location)
+                results.append({"code": location.code, "action": "start", "changed": started, "message": message})
+        self.send_json(200, {"ok": True, "results": results})
+
+    def endpoint_test(self, target: str) -> None:
+        paths = self.require_paths()
+        locations, error = api_resolve_locations(paths, target)
+        if error:
+            self.send_json(404, {"ok": False, "error": error})
+            return
+        if not locations:
+            self.send_json(200, {"ok": False, "error": f"no configs found in {paths.conf_dir}"})
+            return
+        if not shutil.which("curl"):
+            self.send_json(500, {"ok": False, "error": "curl is required for tunnel testing"})
+            return
+        params = self.query_params()
+        test_url = self.query_value(params, "url", DEFAULT_TEST_URL)
+        speed_url = self.query_value(params, "speed_url", DEFAULT_SPEED_URL)
+        try:
+            timeout = int(self.query_value(params, "timeout", "20"))
+        except ValueError:
+            timeout = 20
+        timeout = max(1, min(timeout, 120))
+        include_speed = self.query_value(params, "no_speed", "0").lower() not in {"1", "true", "yes"}
+        results = [test_location_once(location, test_url, speed_url, timeout, include_speed) for location in locations]
+        ok = all(result["ok"] for result in results) and not any(result["speed_error"] for result in results)
+        self.send_json(
+            200,
+            {
+                "ok": ok,
+                "test_url": test_url,
+                "speed_url": speed_url if include_speed else None,
+                "results": results,
+            },
+        )
+
+    def endpoint_autostart_action(self, action: str) -> None:
+        paths = self.require_paths()
+        if action not in {"on", "off", "toggle"}:
+            self.send_json(404, {"ok": False, "error": f"unknown autostart action: {action}"})
+            return
+        if not api_running_as_root():
+            self.send_json(
+                403,
+                {"ok": False, "error": f"autostart {action} requires root; run the API service as root: sudo {APP_NAME} api start"},
+            )
+            return
+        command_autostart(paths, action)
+        enabled, state = autostart_status(paths)
+        self.send_json(200, {"ok": True, "action": action, "enabled": enabled, "state": state})
+
+    def endpoint_port(self, target: str) -> None:
+        paths = self.require_paths()
+        if target.lower() == "all":
+            self.send_json(400, {"ok": False, "error": "port requires a single location code, not all"})
+            return
+        locations, error = api_resolve_locations(paths, target)
+        if error:
+            self.send_json(404, {"ok": False, "error": error})
+            return
+        if not api_running_as_root():
+            self.send_json(
+                403,
+                {"ok": False, "error": f"changing ports requires root; run the API service as root: sudo {APP_NAME} api start"},
+            )
+            return
+        body, body_error = self.read_body_json()
+        if body_error:
+            if body_error != "__sent__":
+                self.send_json(400, {"ok": False, "error": body_error})
+            return
+        socks_port, socks_error = parse_body_port(body or {}, "socks")
+        if socks_error:
+            self.send_json(400, {"ok": False, "error": socks_error})
+            return
+        http_port, http_error = parse_body_port(body or {}, "http")
+        if http_error:
+            self.send_json(400, {"ok": False, "error": http_error})
+            return
+        location = locations[0]
+        ok, events = port_change_result(paths, location, socks_port, http_port)
+        self.send_json(
+            200 if ok else 400,
+            {
+                "ok": ok,
+                "code": location.code,
+                "events": [{"level": level, "message": message} for level, message in events],
+            },
+        )
+
+
+def command_api_serve(paths: Paths, host: str, port: int) -> int:
+    """Run the API server in the foreground (Ctrl-C to stop)."""
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        print_warning(
+            f"API will listen on {host}:{port} and be reachable from the network. "
+            "Protect the token and only allow this port from trusted IPs!"
+        )
+    token = ensure_api_token(paths)
+    ApiRequestHandler.paths = paths
+    ApiRequestHandler.token = token
+    try:
+        server = ThreadingHTTPServer((host, port), ApiRequestHandler)
+    except OSError as exc:
+        raise SystemExit(f"cannot bind API server to {host}:{port}: {exc}") from exc
+
+    print(Color.bold(Color.cyan(f"xPsiphon API  v{VERSION}")))
+    print(f"Listening: http://{host}:{port}")
+    if os.environ.get("XPSIPHON_API_TOKEN"):
+        print("Token:     from XPSIPHON_API_TOKEN environment")
+    else:
+        print(f"Token:     {paths.api_token_file}")
+    print("Auth:      Authorization: Bearer <token>")
+    print("Stop:      Ctrl-C")
+    sys.stdout.flush()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nAPI server stopped.")
+    finally:
+        server.server_close()
+    return 0
+
+
+def api_service_unit(paths: Paths, host: str, port: int) -> str:
+    environment_lines = [
+        f'Environment="XPSIPHON_BIN={paths.psiphon_bin}"',
+        f'Environment="XPSIPHON_CONF_DIR={paths.conf_dir}"',
+        f'Environment="XPSIPHON_DATA_DIR={paths.data_dir}"',
+        f'Environment="XPSIPHON_LOG_DIR={paths.log_dir}"',
+        f'Environment="XPSIPHON_RUN_DIR={paths.run_dir}"',
+        f'Environment="XPSIPHON_API_TOKEN_FILE={paths.api_token_file}"',
+    ]
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=xPsiphon HTTP API server",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            *environment_lines,
+            # The API can write the token file, (de)install the tunnel unit,
+            # and spawn tunnels — so its writable set is broader than the
+            # tunnel unit's, but still bounded.
+            *sandbox_directives(
+                [
+                    paths.data_dir,
+                    paths.log_dir,
+                    paths.run_dir,
+                    paths.api_token_file.parent,
+                    paths.service_path.parent,
+                ]
+            ),
+            f"ExecStart={paths.command_path} api serve --host {host} --port {port}",
+            "Restart=on-failure",
+            "RestartSec=3",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        ]
+    )
+
+
+def command_api_start(paths: Paths, host: str, port: int) -> int:
+    require_root("starting the API service")
+    if not systemd_available():
+        raise SystemExit("systemd is not available on this host")
+    ensure_api_token(paths)
+    paths.api_service_path.write_text(api_service_unit(paths, host, port), encoding="utf-8")
+    result = systemctl("daemon-reload")
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or "systemctl daemon-reload failed")
+    result = systemctl("enable", "--now", API_SERVICE_NAME)
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or f"systemctl enable {API_SERVICE_NAME} failed")
+    print(f"API service started: {API_SERVICE_NAME}")
+    print(f"Listening: http://{host}:{port}")
+    print(f"Token file: {paths.api_token_file}  (view with: sudo cat {paths.api_token_file})")
+    print(f"Check it:   {APP_NAME} api status")
+    return 0
+
+
+def command_api_stop(paths: Paths) -> int:
+    require_root("stopping the API service")
+    if not systemd_available():
+        raise SystemExit("systemd is not available on this host")
+    systemctl("disable", "--now", API_SERVICE_NAME)
+    if paths.api_service_path.exists():
+        paths.api_service_path.unlink()
+    result = systemctl("daemon-reload")
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or "systemctl daemon-reload failed")
+    print("API service stopped.")
+    return 0
+
+
+def command_api_restart(paths: Paths) -> int:
+    require_root("restarting the API service")
+    if not paths.api_service_path.exists():
+        raise SystemExit(f"API service is not installed. Start it with: sudo {APP_NAME} api start")
+    result = systemctl("restart", API_SERVICE_NAME)
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or f"systemctl restart {API_SERVICE_NAME} failed")
+    print(f"API service restarted: {API_SERVICE_NAME}")
+    return 0
+
+
+def api_unit_host_port(paths: Paths) -> tuple[str | None, int | None]:
+    """Best-effort read of --host/--port from the installed API unit file."""
+    try:
+        text = paths.api_service_path.read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    for line in text.splitlines():
+        if line.startswith("ExecStart="):
+            host_match = re.search(r"--host (\S+)", line)
+            port_match = re.search(r"--port (\d+)", line)
+            host = host_match.group(1) if host_match else None
+            port = int(port_match.group(1)) if port_match else None
+            return host, port
+    return None, None
+
+
+def command_api_status(paths: Paths) -> int:
+    print(Color.bold(Color.cyan(f"xPsiphon API  v{VERSION}")))
+    installed = paths.api_service_path.exists()
+    print(f"Service file: {paths.api_service_path} ({'installed' if installed else 'not installed'})")
+    host: str | None = None
+    port: int | None = None
+    if installed:
+        result = systemctl("is-active", API_SERVICE_NAME)
+        state = result.stdout.strip() or result.stderr.strip() or "unknown"
+        print(f"State:        {Color.green(state) if state == 'active' else Color.yellow(state)}")
+        result = systemctl("is-enabled", API_SERVICE_NAME)
+        enabled_state = result.stdout.strip() or result.stderr.strip() or "unknown"
+        print(f"Enabled:      {enabled_state}")
+        host, port = api_unit_host_port(paths)
+        if host and port:
+            print(f"URL:          http://{host}:{port}")
+    token_exists = paths.api_token_file.exists()
+    print(f"Token file:   {paths.api_token_file} ({'exists' if token_exists else 'not created'})")
+    print()
+    display_host = host or DEFAULT_API_HOST
+    display_port = port or DEFAULT_API_PORT
+    print("Test the API:")
+    print(f'  curl -s -H "Authorization: Bearer $(sudo cat {paths.api_token_file})" \\\n        http://{display_host}:{display_port}/api/version')
+    print(f"Foreground (no systemd): {APP_NAME} api serve")
     return 0
 
 
@@ -1651,6 +2658,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "port":
             require_root("changing location ports")
             return command_port(paths, args.target, args.socks, args.http)
+        if args.command == "api":
+            if args.api_command == "serve":
+                return command_api_serve(paths, args.host, args.port)
+            if args.api_command == "start":
+                return command_api_start(paths, args.host, args.port)
+            if args.api_command == "stop":
+                return command_api_stop(paths)
+            if args.api_command == "restart":
+                return command_api_restart(paths)
+            if args.api_command == "status":
+                return command_api_status(paths)
+            return command_api_status(paths)
         if args.command == "update":
             return command_update(paths, args.force_psiphon, args.force_configs)
         if args.command == "uninstall":

@@ -1,0 +1,22 @@
+# Runtime and test artifacts
+.tmp/
+logs/
+*.log
+*.pid
+__pycache__/
+*.py[cod]
+
+# Secrets and credential material — never commit
+.env
+.env.*
+*.key
+*.pem
+id_rsa*
+known_hosts
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Local test suite (kept on the maintainer's machine, not distributed)
+tests/
